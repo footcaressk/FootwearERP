@@ -216,16 +216,21 @@ async def create_user(payload: UserCreate, request: Request):
     require_roles("admin")(user)
     email = payload.email.lower()
     if await db.users.find_one({"email": email}):
-        raise HTTPException(400, "Email already exists")
+        raise HTTPException(409, "Email already exists")
     doc = {
         "email": email, "name": payload.name, "role": payload.role,
         "password_hash": hash_password(payload.password),
         "active": True, "created_at": now_iso(),
     }
     res = await db.users.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("password_hash", None)
-    return doc
+    return {
+        "id": str(res.inserted_id),
+        "email": email,
+        "name": payload.name,
+        "role": payload.role,
+        "active": True,
+        "created_at": doc["created_at"],
+    }
 
 @api.patch("/users/{user_id}")
 async def update_user(user_id: str, payload: UserUpdate, request: Request):
