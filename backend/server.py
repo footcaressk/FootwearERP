@@ -22,6 +22,7 @@ from auth import (
 )
 from po_extractor import extract_po_from_pdf, extract_po_from_xlsx
 from pdf_docs import generate_dispatch_challan_pdf, build_invoice
+from pdf_procurement import build_material_requirement
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 
@@ -164,6 +165,25 @@ class ComponentUpdate(BaseModel):
     bottom_done: Optional[bool] = None
     sole_done: Optional[bool] = None
     notes: Optional[str] = ""
+
+class WorkerIn(BaseModel):
+    name: str
+    phone: Optional[str] = ""
+    skill: str = "general"  # general / cutting / upper / bottom / stitching / lasting / sole_pasting / finishing
+    rate_per_pair: float = 0
+    active: bool = True
+    notes: Optional[str] = ""
+
+class AssignmentUpdate(BaseModel):
+    role: str  # cutting | upper | bottom | sole | stitching | lasting | sole_pasting | finishing
+    worker_id: Optional[str] = None  # null = unassign
+    worker_name: Optional[str] = None  # denormalised for quick display
+
+class QuantityUpdate(BaseModel):
+    quantity: Optional[int] = None
+    completed_qty: Optional[int] = None
+    rejected_qty: Optional[int] = None
+    reason: Optional[str] = ""
 
 class InvoiceGenerate(BaseModel):
     po_id: str
@@ -837,6 +857,211 @@ async def update_job_components(jid: str, payload: ComponentUpdate, request: Req
                                "at": now_iso(), "by": u["email"], "notes": payload.notes or ""}}}
     )
     return stringify(await db.production_jobs.find_one({"_id": oid(jid)}))
+
+
+@api.patch("/production/jobs/{jid}/assignment")
+async def update_job_assignment(jid: str, payload: AssignmentUpdate, request: Request):
+    """Assign / reassign a karigar to a particular role on a job."""
+    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+    job = await db.production_jobs.find_one({"_id": oid(jid)})
+    if not job:
+        raise HTTPException(404, "Not found")
+    assignments = job.get("assignments") or {}
+    if payload.worker_id:
+        worker = await db.workers.find_one({"_id": oid(payload.worker_id)})
+        if not worker:
+            raise HTTPException(404, "Worker not found")
+        assignments[payload.role] = {"worker_id": payload.worker_id, "worker_name": worker.get("name", "")}
+    else:
+        assignments.pop(payload.role, None)
+    await db.production_jobs.update_one(
+        {"_id": oid(jid)},
+        {"$set": {"assignments": assignments, "updated_at": now_iso()},
+         "$push": {"history": {"event": "assignment_update", "role": payload.role,
+                               "worker_id": payload.worker_id, "worker_name": assignments.get(payload.role, {}).get("worker_name", ""),
+                               "at": now_iso(), "by": u["email"]}}}
+    )
+    return stringify(await db.production_jobs.find_one({"_id": oid(jid)}))
+
+
+@api.patch("/production/jobs/{jid}/quantity")
+async def update_job_quantity(jid: str, payload: QuantityUpdate, request: Request):
+    """Increase, reduce or correct the quantity on a job at any stage."""
+    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+    job = await db.production_jobs.find_one({"_id": oid(jid)})
+    if not job:
+        raise HTTPException(404, "Not found")
+    update = {"updated_at": now_iso()}
+    old_qty = job.get("quantity", 0)
+    if payload.quantity is not None:
+        update["quantity"] = int(payload.quantity)
+    if payload.completed_qty is not None:
+        update["completed_qty"] = int(payload.completed_qty)
+    if payload.rejected_qty is not None:
+        update["rejected_qty"] = int(payload.rejected_qty)
+    history_entry = {
+        "event": "quantity_update", "old_quantity": old_qty,
+        "new_quantity": update.get("quantity", old_qty),
+        "completed_qty": update.get("completed_qty"),
+        "rejected_qty": update.get("rejected_qty"),
+        "reason": payload.reason or "",
+        "at": now_iso(), "by": u["email"],
+    }
+    await db.production_jobs.update_one(
+        {"_id": oid(jid)}, {"$set": update, "$push": {"history": history_entry}}
+    )
+    return stringify(await db.production_jobs.find_one({"_id": oid(jid)}))
+
+
+# ---------- WORKERS / KARIGARS ----------
+@api.get("/workers")
+async def list_workers(request: Request):
+    await get_current_user(request)
+    docs = await db.workers.find({}).sort("name", 1).to_list(500)
+    return [stringify(d) for d in docs]
+
+@api.post("/workers")
+async def create_worker(payload: WorkerIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    doc = payload.model_dump()
+    doc["created_at"] = now_iso()
+    doc["updated_at"] = now_iso()
+    res = await db.workers.insert_one(doc)
+    doc.pop("_id", None)
+    doc["id"] = str(res.inserted_id)
+    return doc
+
+@api.patch("/workers/{wid}")
+async def update_worker(wid: str, payload: WorkerIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    update = payload.model_dump()
+    update["updated_at"] = now_iso()
+    await db.workers.update_one({"_id": oid(wid)}, {"$set": update})
+    return stringify(await db.workers.find_one({"_id": oid(wid)}))
+
+@api.delete("/workers/{wid}")
+async def delete_worker(wid: str, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    await db.workers.delete_one({"_id": oid(wid)})
+    return {"ok": True}
+
+
+# ---------- PROCUREMENT MATERIAL REQUIREMENT ----------
+async def _compute_material_requirement(job_ids: list[str]) -> dict:
+    """Aggregate material requirements across jobs based on their style BOM and yield."""
+    obj_ids = []
+    for jid in job_ids:
+        try:
+            obj_ids.append(oid(jid))
+        except HTTPException:
+            continue
+    jobs = await db.production_jobs.find({"_id": {"$in": obj_ids}}).to_list(2000)
+    # Pre-load styles for these jobs (by style_code)
+    style_codes = list({j.get("style_code") for j in jobs})
+    styles = await db.styles.find({"code": {"$in": style_codes}}).to_list(500)
+    style_map = {s["code"]: stringify(s) for s in styles}
+
+    # Pre-load all materials (for fresh rate + category info)
+    materials = await db.materials.find({}).to_list(2000)
+    mat_map = {str(m["_id"]): stringify(m) for m in materials}
+
+    # Aggregate
+    requirements = {}  # key = material_id or material_code; value = {code,name,category,unit,rate,total_qty}
+    jobs_summary = []
+    for j in jobs:
+        st = style_map.get(j.get("style_code"))
+        pairs = j.get("quantity", 0)
+        jobs_summary.append({
+            "po_number": j.get("po_number"),
+            "style_code": j.get("style_code"),
+            "color": j.get("color"),
+            "total_pairs": pairs,
+            "sizes_text": f"Size {j.get('size','')}",
+        })
+        if not st or not pairs:
+            continue
+        for b in st.get("bom", []):
+            mid = b.get("material_id") or b.get("material_code")
+            code = b.get("material_code") or ""
+            name = b.get("material_name") or ""
+            unit = b.get("unit") or ""
+            rate = float(b.get("rate", 0))
+            yld = float(b.get("yield_per_unit", 1) or 1)
+            qty = float(b.get("quantity", 0))
+            waste = float(b.get("waste_pct", 0) or 0)
+            # per pair material in unit terms = qty / yield * (1 + waste%)
+            per_pair = (qty / yld) * (1 + waste / 100)
+            total_qty = per_pair * pairs
+            key = code or mid
+            if key not in requirements:
+                cat = mat_map.get(str(mid), {}).get("category", b.get("section", "other"))
+                requirements[key] = {
+                    "code": code, "name": name, "category": cat, "unit": unit,
+                    "rate": rate, "total_qty_required": 0.0, "total_cost": 0.0,
+                }
+            requirements[key]["total_qty_required"] += total_qty
+            requirements[key]["total_cost"] += total_qty * rate
+
+    # Round
+    material_lines = []
+    for v in requirements.values():
+        v["total_qty_required"] = round(v["total_qty_required"], 2)
+        v["total_cost"] = round(v["total_cost"], 2)
+        material_lines.append(v)
+    material_lines.sort(key=lambda m: (m["category"], m["code"]))
+
+    # Merge jobs_summary for same (style+color) so summary is one row per card
+    merged = {}
+    for js in jobs_summary:
+        key = (js["po_number"], js["style_code"], js["color"])
+        if key not in merged:
+            merged[key] = {**js, "sizes_text": "", "_sizes": set()}
+        merged[key]["total_pairs"] += 0 if merged[key] is js else js["total_pairs"]
+        # nb already counted? Let's just keep simple and aggregate
+    # Simpler: aggregate inline
+    summary_agg = {}
+    for js in jobs_summary:
+        key = (js["po_number"], js["style_code"], js["color"])
+        if key not in summary_agg:
+            summary_agg[key] = {"po_number": js["po_number"], "style_code": js["style_code"],
+                                "color": js["color"], "total_pairs": 0, "_sizes": []}
+        summary_agg[key]["total_pairs"] += js["total_pairs"]
+        sz = js["sizes_text"].replace("Size ", "")
+        if sz and sz not in summary_agg[key]["_sizes"]:
+            summary_agg[key]["_sizes"].append(sz)
+    summary_out = []
+    for v in summary_agg.values():
+        summary_out.append({
+            "po_number": v["po_number"], "style_code": v["style_code"], "color": v["color"],
+            "total_pairs": v["total_pairs"],
+            "sizes_text": ", ".join(sorted(v["_sizes"], key=lambda x: (float(x) if x.replace('.', '', 1).isdigit() else 999))),
+        })
+    return {"jobs": summary_out, "materials": material_lines}
+
+
+@api.post("/procurement/requirement")
+async def procurement_requirement(payload: dict, request: Request):
+    await get_current_user(request)
+    job_ids = payload.get("job_ids", [])
+    if not job_ids:
+        raise HTTPException(400, "job_ids required")
+    return await _compute_material_requirement(job_ids)
+
+
+@api.post("/procurement/requirement.pdf")
+async def procurement_requirement_pdf(payload: dict, request: Request):
+    await get_current_user(request)
+    job_ids = payload.get("job_ids", [])
+    if not job_ids:
+        raise HTTPException(400, "job_ids required")
+    scope_label = payload.get("scope_label") or f"{len(job_ids)} production card(s)"
+    notes = payload.get("notes", "")
+    data = await _compute_material_requirement(job_ids)
+    pdf_bytes = build_material_requirement(scope_label, data["jobs"], data["materials"], notes)
+    return StreamingResponse(
+        BytesIO(pdf_bytes), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="material-requirement-{datetime.now().strftime("%Y%m%d-%H%M")}.pdf"'},
+    )
 
 
 # ---------- DEFECTS ----------

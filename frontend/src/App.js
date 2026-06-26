@@ -5,6 +5,7 @@ import Login from "@/pages/Login";
 import AppShell from "@/pages/AppShell";
 import Dashboard from "@/pages/Dashboard";
 import Materials from "@/pages/Materials";
+import Workers from "@/pages/Workers";
 import Styles from "@/pages/Styles";
 import Costing from "@/pages/Costing";
 import POs from "@/pages/POs";
@@ -37,6 +38,7 @@ function App() {
           <Route path="/" element={<Protected><AppShell /></Protected>}>
             <Route index element={<Dashboard />} />
             <Route path="materials" element={<Materials />} />
+            <Route path="workers" element={<Workers />} />
             <Route path="styles" element={<Styles />} />
             <Route path="costing" element={<Costing />} />
             <Route path="pos" element={<POs />} />

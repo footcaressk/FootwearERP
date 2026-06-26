@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { http, inr, API } from "../lib/api";
+import { http } from "../lib/api";
 import { PageHeader, Card, BtnPrimary, BtnSecondary } from "../components/ui-kit";
 import { useAuth } from "../lib/auth";
-import { FileDown, Check } from "lucide-react";
+import { FileDown, Check, UserPlus, Edit3, ClipboardList, X } from "lucide-react";
 
 const STAGES = [
   { key: "procurement", label: "Procurement", color: "#64748B" },
@@ -22,13 +22,22 @@ const COMPONENT_LAYERS = {
   sole: ["Sole"],
 };
 
+const ASSIGNMENT_ROLES = [
+  { key: "cutting", label: "Cutting" },
+  { key: "upper", label: "Upper" },
+  { key: "bottom", label: "Bottom/Insole" },
+  { key: "stitching", label: "Stitching" },
+  { key: "lasting", label: "Lasting" },
+  { key: "sole_pasting", label: "Sole Pasting" },
+  { key: "finishing", label: "Finishing" },
+];
+
 const sortSizes = (a, b) => {
   const na = parseFloat(a), nb = parseFloat(b);
   if (!isNaN(na) && !isNaN(nb)) return na - nb;
   return String(a).localeCompare(String(b));
 };
 
-/** Group jobs by (po_number, style_code, color) — one card per color. */
 function groupJobsByColor(jobs) {
   const groups = {};
   for (const j of jobs) {
@@ -36,16 +45,9 @@ function groupJobsByColor(jobs) {
     const key = `${j.po_number}::${j.style_code}::${color}`;
     if (!groups[key]) {
       groups[key] = {
-        key,
-        po_number: j.po_number,
-        po_id: j.po_id,
-        style_code: j.style_code,
-        client_name: j.client_name,
-        description: j.description,
-        delivery_date: j.delivery_date,
-        color,
-        rows: [],
-        sizes: new Set(),
+        key, po_number: j.po_number, po_id: j.po_id, style_code: j.style_code,
+        client_name: j.client_name, description: j.description, delivery_date: j.delivery_date,
+        color, rows: [], sizes: new Set(),
       };
     }
     groups[key].rows.push(j);
@@ -56,74 +58,71 @@ function groupJobsByColor(jobs) {
     sizes: Array.from(g.sizes).sort(sortSizes),
     totalQty: g.rows.reduce((s, r) => s + (r.quantity || 0), 0),
     components: aggregateComponents(g.rows),
+    assignments: aggregateAssignments(g.rows),
   }));
 }
 
 function aggregateComponents(rows) {
-  // a component is considered done if it's done on ALL rows in the group
   const all = (key) => rows.every(r => r.components?.[key]);
-  return {
-    upper_done: all("upper_done"),
-    bottom_done: all("bottom_done"),
-    sole_done: all("sole_done"),
-  };
+  return { upper_done: all("upper_done"), bottom_done: all("bottom_done"), sole_done: all("sole_done") };
+}
+
+// take assignment from the first row for display (all rows in the group share)
+function aggregateAssignments(rows) {
+  const r0 = rows[0] || {};
+  return r0.assignments || {};
 }
 
 export default function Production() {
   const [jobs, setJobs] = useState([]);
-  const [selected, setSelected] = useState({}); // keyed by group.key
+  const [workers, setWorkers] = useState([]);
+  const [selected, setSelected] = useState({}); // for dispatched merge invoice
+  const [procSelected, setProcSelected] = useState({}); // for procurement merge requirement
   const [merging, setMerging] = useState(false);
+  const [assignFor, setAssignFor] = useState(null); // {group, role}
+  const [qtyFor, setQtyFor] = useState(null); // {group, rowId}
   const { user } = useAuth();
   const canEdit = ["admin", "manager", "production"].includes(user?.role);
 
   const load = async () => {
-    const { data } = await http.get("/production/jobs");
-    setJobs(data);
+    const [j, w] = await Promise.all([http.get("/production/jobs"), http.get("/workers")]);
+    setJobs(j.data); setWorkers(w.data);
   };
   useEffect(() => { load(); }, []);
 
   const moveGroup = async (group, nextStage) => {
+    await Promise.all(group.rows.map(j => http.patch(`/production/jobs/${j.id}`, { stage: nextStage })));
+    load();
+  };
+  const toggleComponent = async (group, key, val) => {
+    await Promise.all(group.rows.map(j => http.patch(`/production/jobs/${j.id}/components`, { [key]: val })));
+    load();
+  };
+  const assignWorker = async (group, role, workerId) => {
     await Promise.all(group.rows.map(j =>
-      http.patch(`/production/jobs/${j.id}`, { stage: nextStage })
+      http.patch(`/production/jobs/${j.id}/assignment`, { role, worker_id: workerId || null })
     ));
+    setAssignFor(null);
+    load();
+  };
+  const saveQuantity = async (rowId, body) => {
+    await http.patch(`/production/jobs/${rowId}/quantity`, body);
+    setQtyFor(null);
     load();
   };
 
-  const toggleComponent = async (group, componentKey, value) => {
-    await Promise.all(group.rows.map(j =>
-      http.patch(`/production/jobs/${j.id}/components`, { [componentKey]: value })
-    ));
-    load();
-  };
-
-  const toggleSelect = (group) => {
-    setSelected((s) => {
-      const next = { ...s };
-      if (next[group.key]) delete next[group.key]; else next[group.key] = group;
-      return next;
-    });
-  };
-
+  // Dispatched merge invoice
+  const toggleSelect = (group) => setSelected(s => {
+    const next = { ...s }; if (next[group.key]) delete next[group.key]; else next[group.key] = group; return next;
+  });
   const downloadGroupInvoice = async (group) => {
     try {
-      const job_ids = group.rows.map(r => r.id);
-      const res = await http.post("/invoices/job", { po_id: group.po_id, job_ids }, { responseType: "blob" });
-      const url = URL.createObjectURL(new Blob([res.data], { type: "application/pdf" }));
-      window.open(url, "_blank");
-    } catch (e) {
-      alert("Invoice failed: " + (e.response?.data?.detail || e.message));
-    }
+      const res = await http.post("/invoices/job", { po_id: group.po_id, job_ids: group.rows.map(r => r.id) }, { responseType: "blob" });
+      window.open(URL.createObjectURL(new Blob([res.data], { type: "application/pdf" })), "_blank");
+    } catch (e) { alert("Invoice failed: " + (e.response?.data?.detail || e.message)); }
   };
-
   const downloadMergedInvoice = async () => {
-    const groups = Object.values(selected);
-    if (!groups.length) return;
-    // ensure same client
-    const clients = new Set(groups.map(g => g.client_name));
-    if (clients.size > 1) {
-      if (!window.confirm("Selected items belong to different clients. Continue with merged invoice using the first client's billing details?")) return;
-    }
-    // group by po_id
+    const groups = Object.values(selected); if (!groups.length) return;
     const byPo = {};
     for (const g of groups) {
       if (!byPo[g.po_id]) byPo[g.po_id] = { po_id: g.po_id, job_ids: [] };
@@ -132,17 +131,28 @@ export default function Production() {
     try {
       setMerging(true);
       const res = await http.post("/invoices/merged", { entries: Object.values(byPo) }, { responseType: "blob" });
-      const url = URL.createObjectURL(new Blob([res.data], { type: "application/pdf" }));
-      window.open(url, "_blank");
+      window.open(URL.createObjectURL(new Blob([res.data], { type: "application/pdf" })), "_blank");
       setSelected({});
-    } catch (e) {
-      alert("Merged invoice failed: " + (e.response?.data?.detail || e.message));
-    } finally {
-      setMerging(false);
-    }
+    } catch (e) { alert("Merged failed: " + (e.response?.data?.detail || e.message)); }
+    finally { setMerging(false); }
   };
 
-  const dispatchedSelectedCount = Object.keys(selected).length;
+  // Procurement: select cards & generate material requirement
+  const toggleProcSelect = (group) => setProcSelected(s => {
+    const next = { ...s }; if (next[group.key]) delete next[group.key]; else next[group.key] = group; return next;
+  });
+  const downloadMaterialRequirement = async (groups, label) => {
+    const job_ids = [];
+    groups.forEach(g => g.rows.forEach(r => job_ids.push(r.id)));
+    try {
+      const res = await http.post("/procurement/requirement.pdf",
+        { job_ids, scope_label: label || `${groups.length} card(s)` }, { responseType: "blob" });
+      window.open(URL.createObjectURL(new Blob([res.data], { type: "application/pdf" })), "_blank");
+    } catch (e) { alert("Material requirement failed: " + (e.response?.data?.detail || e.message)); }
+  };
+
+  const dispatchedCount = Object.keys(selected).length;
+  const procSelectedCount = Object.keys(procSelected).length;
 
   return (
     <div>
@@ -150,12 +160,21 @@ export default function Production() {
         title="Production Floor"
         subtitle="Manufacturing / Kanban"
         testId="production-header"
-        action={dispatchedSelectedCount > 0 ? (
-          <BtnPrimary onClick={downloadMergedInvoice} disabled={merging} data-testid="merged-invoice-btn">
-            <FileDown className="w-3.5 h-3.5 inline -mt-0.5 mr-1" />
-            {merging ? "Generating..." : `Merge Invoice (${dispatchedSelectedCount})`}
-          </BtnPrimary>
-        ) : null}
+        action={
+          <div className="flex gap-2">
+            {procSelectedCount > 0 && (
+              <BtnPrimary onClick={() => { downloadMaterialRequirement(Object.values(procSelected), `${procSelectedCount} procurement cards`); setProcSelected({}); }} data-testid="merged-mr-btn">
+                <ClipboardList className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Material Requirement ({procSelectedCount})
+              </BtnPrimary>
+            )}
+            {dispatchedCount > 0 && (
+              <BtnPrimary onClick={downloadMergedInvoice} disabled={merging} data-testid="merged-invoice-btn">
+                <FileDown className="w-3.5 h-3.5 inline -mt-0.5 mr-1" />
+                {merging ? "..." : `Merge Invoice (${dispatchedCount})`}
+              </BtnPrimary>
+            )}
+          </div>
+        }
       />
 
       <div className="p-8">
@@ -165,8 +184,10 @@ export default function Production() {
               const stageJobs = jobs.filter((j) => j.stage === s.key);
               const groups = groupJobsByColor(stageJobs);
               const totalQty = stageJobs.reduce((sum, j) => sum + j.quantity, 0);
+              const isProc = s.key === "procurement";
+              const isDisp = s.key === "dispatched";
               return (
-                <div key={s.key} className="w-[380px] flex-shrink-0" data-testid={`column-${s.key}`}>
+                <div key={s.key} className="w-[400px] flex-shrink-0" data-testid={`column-${s.key}`}>
                   <div className="bg-white border-2 border-slate-200 border-t-4 mb-3 p-3" style={{ borderTopColor: s.color }}>
                     <div className="flex items-baseline justify-between">
                       <div className="font-bold uppercase tracking-wider text-sm">{s.label}</div>
@@ -183,12 +204,19 @@ export default function Production() {
                       <ColorGroupCard
                         key={g.key}
                         group={g}
+                        workers={workers}
                         stageColor={s.color}
                         stageIdx={STAGES.findIndex(x => x.key === s.key)}
                         canEdit={canEdit}
                         onMove={moveGroup}
                         onToggleComponent={toggleComponent}
-                        isDispatched={s.key === "dispatched"}
+                        onOpenAssign={(role) => setAssignFor({ group: g, role })}
+                        onOpenQty={(rowId) => setQtyFor({ group: g, rowId })}
+                        isProc={isProc}
+                        isDispatched={isDisp}
+                        onMatReq={() => downloadMaterialRequirement([g], `${g.style_code} · ${g.color}`)}
+                        procSelected={!!procSelected[g.key]}
+                        onToggleProcSelect={toggleProcSelect}
                         onDownloadInvoice={downloadGroupInvoice}
                         isSelected={!!selected[g.key]}
                         onToggleSelect={toggleSelect}
@@ -201,28 +229,52 @@ export default function Production() {
           </div>
         </div>
         {jobs.length === 0 && (
-          <Card className="p-12 text-center text-slate-400 mt-4">
-            No production jobs yet. Create a Purchase Order — jobs are auto-generated per line item.
-          </Card>
+          <Card className="p-12 text-center text-slate-400 mt-4">No production jobs yet.</Card>
         )}
       </div>
+
+      {assignFor && (
+        <AssignDialog
+          group={assignFor.group}
+          role={assignFor.role}
+          workers={workers}
+          current={assignFor.group.assignments?.[assignFor.role]}
+          onSave={(wid) => assignWorker(assignFor.group, assignFor.role, wid)}
+          onClose={() => setAssignFor(null)}
+        />
+      )}
+
+      {qtyFor && (
+        <QuantityDialog
+          group={qtyFor.group}
+          row={qtyFor.group.rows.find(r => r.id === qtyFor.rowId)}
+          onSave={(body) => saveQuantity(qtyFor.rowId, body)}
+          onClose={() => setQtyFor(null)}
+        />
+      )}
     </div>
   );
 }
 
-function ColorGroupCard({ group, stageColor, stageIdx, canEdit, onMove, onToggleComponent, isDispatched, onDownloadInvoice, isSelected, onToggleSelect }) {
+function ColorGroupCard(props) {
+  const { group, stageColor, stageIdx, canEdit, onMove, onToggleComponent,
+    onOpenAssign, onOpenQty, isProc, isDispatched, onMatReq,
+    procSelected, onToggleProcSelect, isSelected, onToggleSelect, onDownloadInvoice } = props;
   const nextStage = STAGES[stageIdx + 1];
   const prevStage = STAGES[stageIdx - 1];
 
-  // size totals
   const sizeTotals = useMemo(() => {
-    const t = {};
+    const t = {}; const rowIdBySize = {};
     for (const sz of group.sizes) {
       const row = group.rows.find(r => String(r.size || "—") === sz);
       t[sz] = row?.quantity || 0;
+      rowIdBySize[sz] = row?.id;
     }
-    return t;
+    return { t, rowIdBySize };
   }, [group]);
+
+  const completedTotal = group.rows.reduce((s, r) => s + (r.completed_qty || 0), 0);
+  const a = group.assignments || {};
 
   return (
     <Card className="border-l-4 hover:border-[#C27842] transition-colors" style={{ borderLeftColor: stageColor }} data-testid={`group-${group.key}`}>
@@ -238,18 +290,30 @@ function ColorGroupCard({ group, stageColor, stageIdx, canEdit, onMove, onToggle
               <span className="font-bold text-[#C27842]">{group.color}</span>
               <span className="text-slate-400 mx-1">·</span>
               <span className="text-slate-600 font-mono">{group.totalQty} pairs</span>
+              {completedTotal > 0 && (
+                <>
+                  <span className="text-slate-400 mx-1">·</span>
+                  <span className="text-green-700 font-mono">{completedTotal} done</span>
+                </>
+              )}
             </div>
           </div>
           {isDispatched && (
-            <label className="inline-flex items-center gap-1.5 cursor-pointer" title="Select for merged invoice">
+            <label className="inline-flex items-center gap-1.5 cursor-pointer">
               <input type="checkbox" checked={isSelected} onChange={() => onToggleSelect(group)} className="w-4 h-4 accent-[#C27842]" data-testid={`select-${group.key}`} />
               <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500">Merge</span>
+            </label>
+          )}
+          {isProc && (
+            <label className="inline-flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={procSelected} onChange={() => onToggleProcSelect(group)} className="w-4 h-4 accent-[#2563EB]" data-testid={`proc-select-${group.key}`} />
+              <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500">Combine</span>
             </label>
           )}
         </div>
       </div>
 
-      {/* Size matrix */}
+      {/* Size matrix with click-to-edit qty */}
       <div className="p-3 overflow-x-auto">
         <table className="w-full text-xs border border-slate-200">
           <thead className="bg-slate-50">
@@ -263,39 +327,74 @@ function ColorGroupCard({ group, stageColor, stageIdx, canEdit, onMove, onToggle
           </thead>
           <tbody>
             <tr className="border-t border-slate-200">
-              <td className="px-2 py-1.5 font-bold text-slate-700 border-r border-slate-200" data-testid={`color-row-${group.color}`}>{group.color}</td>
+              <td className="px-2 py-1.5 font-bold text-slate-700 border-r border-slate-200">{group.color}</td>
               {group.sizes.map(sz => (
-                <td key={sz} className="px-2 py-1.5 text-center font-mono border-r border-slate-200 last:border-r-0">{sizeTotals[sz]}</td>
+                <td key={sz} className="px-2 py-1.5 text-center font-mono border-r border-slate-200 last:border-r-0">
+                  {canEdit ? (
+                    <button onClick={() => onOpenQty(sizeTotals.rowIdBySize[sz])} className="hover:text-[#C27842] hover:underline w-full" data-testid={`qty-${group.key}-${sz}`}>
+                      {sizeTotals.t[sz]}
+                    </button>
+                  ) : sizeTotals.t[sz]}
+                </td>
               ))}
               <td className="px-2 py-1.5 text-right font-mono font-bold bg-[#0F172A] text-[#C27842]">{group.totalQty}</td>
             </tr>
           </tbody>
         </table>
+        {canEdit && (
+          <div className="text-[9px] text-slate-400 mt-1 italic">Click any qty cell to edit / adjust completed / rejected</div>
+        )}
       </div>
 
-      {/* Component tracker */}
+      {/* Components */}
       <div className="px-3 pb-2">
         <div className="text-[10px] uppercase tracking-[0.15em] font-bold text-slate-500 mb-1.5">Components</div>
         <div className="grid grid-cols-3 gap-2">
           <ComponentCell label="Upper" done={group.components.upper_done} layers={COMPONENT_LAYERS.upper}
-            disabled={!canEdit} onToggle={(v) => onToggleComponent(group, "upper_done", v)} testId={`comp-upper-${group.key}`} />
+            disabled={!canEdit} onToggle={(v) => onToggleComponent(group, "upper_done", v)} />
           <ComponentCell label="Bottom/Insole" done={group.components.bottom_done} layers={COMPONENT_LAYERS.bottom}
-            disabled={!canEdit} onToggle={(v) => onToggleComponent(group, "bottom_done", v)} testId={`comp-bottom-${group.key}`} />
+            disabled={!canEdit} onToggle={(v) => onToggleComponent(group, "bottom_done", v)} />
           <ComponentCell label="Sole" done={group.components.sole_done} layers={COMPONENT_LAYERS.sole}
-            disabled={!canEdit} onToggle={(v) => onToggleComponent(group, "sole_done", v)} testId={`comp-sole-${group.key}`} />
+            disabled={!canEdit} onToggle={(v) => onToggleComponent(group, "sole_done", v)} />
+        </div>
+      </div>
+
+      {/* Karigar assignments */}
+      <div className="px-3 pb-2">
+        <div className="text-[10px] uppercase tracking-[0.15em] font-bold text-slate-500 mb-1.5">Karigars</div>
+        <div className="grid grid-cols-2 gap-1.5">
+          {ASSIGNMENT_ROLES.map(r => (
+            <button
+              key={r.key}
+              disabled={!canEdit}
+              onClick={() => onOpenAssign(r.key)}
+              data-testid={`assign-${group.key}-${r.key}`}
+              className={`flex items-center justify-between gap-1 px-2 py-1 border ${a[r.key] ? "border-[#C27842] bg-orange-50" : "border-dashed border-slate-300 bg-white"} hover:border-slate-900 text-left transition-colors`}
+            >
+              <span className="text-[9px] uppercase tracking-wider font-bold text-slate-500">{r.label}</span>
+              <span className={`text-[10px] font-bold truncate ${a[r.key] ? "text-[#0F172A]" : "text-slate-400 italic"}`}>
+                {a[r.key]?.worker_name || "Assign…"}
+              </span>
+            </button>
+          ))}
         </div>
       </div>
 
       <div className="px-3 pb-3 flex items-center justify-between gap-2 flex-wrap">
         {group.delivery_date && <div className="text-[10px] text-slate-500">Deliver: {group.delivery_date}</div>}
-        <div className="flex gap-2 ml-auto items-center">
+        <div className="flex gap-2 ml-auto items-center flex-wrap">
+          {isProc && (
+            <button onClick={onMatReq} className="text-[10px] uppercase tracking-wider font-bold text-white bg-[#2563EB] hover:bg-[#1E40AF] px-3 py-1 flex items-center gap-1" data-testid={`mat-req-${group.key}`}>
+              <ClipboardList className="w-3 h-3" /> Material Req.
+            </button>
+          )}
           {isDispatched && (
             <button onClick={() => onDownloadInvoice(group)} className="text-[10px] uppercase tracking-wider font-bold text-white bg-[#C27842] hover:bg-[#A65D24] px-3 py-1 flex items-center gap-1" data-testid={`invoice-btn-${group.key}`}>
               <FileDown className="w-3 h-3" /> Invoice
             </button>
           )}
           {canEdit && prevStage && (
-            <button onClick={() => onMove(group, prevStage.key)} className="text-[10px] uppercase tracking-wider font-bold text-slate-500 hover:text-slate-900 border border-slate-300 px-2 py-1" data-testid={`move-prev-${group.key}`}>← {prevStage.label}</button>
+            <button onClick={() => onMove(group, prevStage.key)} className="text-[10px] uppercase tracking-wider font-bold text-slate-500 hover:text-slate-900 border border-slate-300 px-2 py-1">← {prevStage.label}</button>
           )}
           {canEdit && nextStage && (
             <button onClick={() => onMove(group, nextStage.key)} className="text-[10px] uppercase tracking-wider font-bold text-white bg-[#0F172A] hover:bg-[#C27842] px-3 py-1" data-testid={`move-next-${group.key}`}>{nextStage.label} →</button>
@@ -306,25 +405,133 @@ function ColorGroupCard({ group, stageColor, stageIdx, canEdit, onMove, onToggle
   );
 }
 
-function ComponentCell({ label, done, layers, onToggle, disabled, testId }) {
+function ComponentCell({ label, done, layers, onToggle, disabled }) {
   return (
     <div className={`border-2 p-2 ${done ? "border-[#16A34A] bg-green-50" : "border-slate-200 bg-white"}`}>
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={() => onToggle(!done)}
-        data-testid={testId}
-        className="w-full flex items-center justify-between gap-1 text-left"
-      >
+      <button type="button" disabled={disabled} onClick={() => onToggle(!done)}
+        className="w-full flex items-center justify-between gap-1 text-left">
         <span className="text-[10px] uppercase tracking-wider font-bold text-slate-700">{label}</span>
         <span className={`w-4 h-4 grid place-items-center border-2 ${done ? "bg-[#16A34A] border-[#16A34A]" : "border-slate-400 bg-white"}`}>
           {done && <Check className="w-3 h-3 text-white" strokeWidth={3} />}
         </span>
       </button>
       <div className="mt-1 space-y-0.5">
-        {layers.map(l => (
-          <div key={l} className="text-[9px] text-slate-500 leading-tight">• {l}</div>
-        ))}
+        {layers.map(l => <div key={l} className="text-[9px] text-slate-500 leading-tight">• {l}</div>)}
+      </div>
+    </div>
+  );
+}
+
+function AssignDialog({ group, role, workers, current, onSave, onClose }) {
+  const roleObj = ASSIGNMENT_ROLES.find(r => r.key === role);
+  // Prefer workers of matching skill (or 'general')
+  const matchingSkill = role; // role keys align with skill keys for most
+  const sorted = [...workers].sort((a, b) => {
+    const am = (a.skill === matchingSkill || a.skill === "general") ? 0 : 1;
+    const bm = (b.skill === matchingSkill || b.skill === "general") ? 0 : 1;
+    return am - bm;
+  });
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" data-testid="assign-dialog">
+      <div className="bg-white border-2 border-slate-200 shadow-2xl w-full max-w-md">
+        <div className="px-5 py-4 border-b-2 border-slate-200 flex items-center justify-between">
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-slate-500 font-bold">Assign Karigar</div>
+            <div className="font-bold text-base">{group.style_code} · {group.color} · {roleObj?.label}</div>
+          </div>
+          <button onClick={onClose} className="p-1 hover:bg-slate-100"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="p-5 max-h-[60vh] overflow-y-auto">
+          {sorted.length === 0 ? (
+            <div className="text-center text-sm text-slate-500 py-8">
+              No karigars yet. Go to <b>Karigars</b> tab and add some first.
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              <button
+                onClick={() => onSave(null)}
+                data-testid="assign-clear"
+                className="w-full text-left px-3 py-2 border border-slate-200 hover:border-red-500 hover:text-red-700 text-xs font-bold uppercase tracking-wider"
+              >
+                ✕ Unassign
+              </button>
+              {sorted.map(w => (
+                <button
+                  key={w.id}
+                  onClick={() => onSave(w.id)}
+                  data-testid={`assign-worker-${w.id}`}
+                  className={`w-full text-left px-3 py-2 border ${current?.worker_id === w.id ? "border-[#C27842] bg-orange-50" : "border-slate-200"} hover:border-[#0F172A] flex items-center justify-between`}
+                >
+                  <div>
+                    <div className="font-bold text-sm">{w.name}</div>
+                    <div className="text-[10px] text-slate-500 uppercase tracking-wider">{w.skill}{w.phone ? ` · ${w.phone}` : ""}</div>
+                  </div>
+                  <div className="text-xs font-mono">₹{w.rate_per_pair}/pr</div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function QuantityDialog({ group, row, onSave, onClose }) {
+  const [qty, setQty] = useState(row?.quantity || 0);
+  const [completed, setCompleted] = useState(row?.completed_qty || 0);
+  const [rejected, setRejected] = useState(row?.rejected_qty || 0);
+  const [reason, setReason] = useState("");
+
+  const save = () => {
+    onSave({
+      quantity: Number(qty),
+      completed_qty: Number(completed),
+      rejected_qty: Number(rejected),
+      reason,
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" data-testid="qty-dialog">
+      <div className="bg-white border-2 border-slate-200 shadow-2xl w-full max-w-md">
+        <div className="px-5 py-4 border-b-2 border-slate-200 flex items-center justify-between">
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-slate-500 font-bold">Edit Quantity</div>
+            <div className="font-bold text-base">{group.style_code} · {group.color} · Size {row?.size}</div>
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider mt-0.5">Stage: {row?.stage}</div>
+          </div>
+          <button onClick={onClose} className="p-1 hover:bg-slate-100"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="p-5 space-y-3">
+          <div>
+            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Planned Qty (pairs)</label>
+            <input type="number" value={qty} onChange={(e) => setQty(e.target.value)} data-testid="qty-input-planned"
+              className="w-full border-2 border-slate-300 px-3 py-2 font-mono text-lg focus:border-[#2563EB] focus:outline-none" />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Completed</label>
+              <input type="number" value={completed} onChange={(e) => setCompleted(e.target.value)} data-testid="qty-input-completed"
+                className="w-full border-2 border-slate-300 px-3 py-2 font-mono focus:border-[#16A34A] focus:outline-none" />
+            </div>
+            <div>
+              <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Rejected</label>
+              <input type="number" value={rejected} onChange={(e) => setRejected(e.target.value)} data-testid="qty-input-rejected"
+                className="w-full border-2 border-slate-300 px-3 py-2 font-mono focus:border-red-500 focus:outline-none" />
+            </div>
+          </div>
+          <div>
+            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Reason (optional)</label>
+            <input type="text" value={reason} onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g., 5 pairs damaged in cutting"
+              className="w-full border-2 border-slate-300 px-3 py-2 text-sm focus:border-[#2563EB] focus:outline-none" />
+          </div>
+          <div className="flex gap-2 pt-3 border-t border-slate-200">
+            <BtnPrimary onClick={save} data-testid="qty-save"><Check className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Save</BtnPrimary>
+            <BtnSecondary onClick={onClose}>Cancel</BtnSecondary>
+          </div>
+        </div>
       </div>
     </div>
   );
