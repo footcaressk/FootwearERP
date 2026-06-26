@@ -113,9 +113,12 @@ export default function Production() {
     await Promise.all(group.rows.map(j => http.patch(`/production/jobs/${j.id}/components`, { [key]: val })));
     load();
   };
-  const assignWorker = async (group, role, workerId) => {
+  const assignWorker = async (group, role, workerId, rate) => {
     await Promise.all(group.rows.map(j =>
-      http.patch(`/production/jobs/${j.id}/assignment`, { role, worker_id: workerId || null })
+      http.patch(`/production/jobs/${j.id}/assignment`, {
+        role, worker_id: workerId || null,
+        rate_per_pair: rate === undefined || rate === "" ? null : Number(rate),
+      })
     ));
     setAssignFor(null);
     load();
@@ -188,6 +191,7 @@ export default function Production() {
       job_ids: stageJobs.map(j => j.id),
       stage_label: STAGES.find(s => s.key === stageKey)?.label || stageKey,
       card_count: groupJobsByColor(stageJobs).length,
+      rate: draggingWorker.rate_per_pair,
     });
     setDropZone(null);
   };
@@ -198,6 +202,8 @@ export default function Production() {
         job_ids: bulkConfirm.job_ids,
         role: bulkConfirm.role,
         worker_id: bulkConfirm.worker.id,
+        rate_per_pair: bulkConfirm.rate === "" || bulkConfirm.rate === null || bulkConfirm.rate === undefined
+          ? null : Number(bulkConfirm.rate),
       });
       setBulkConfirm(null);
       load();
@@ -310,7 +316,7 @@ export default function Production() {
           role={assignFor.role}
           workers={workers}
           current={assignFor.group.assignments?.[assignFor.role]}
-          onSave={(wid) => assignWorker(assignFor.group, assignFor.role, wid)}
+          onSave={(wid, rate) => assignWorker(assignFor.group, assignFor.role, wid, rate)}
           onClose={() => setAssignFor(null)}
         />
       )}
@@ -363,9 +369,17 @@ export default function Production() {
             </div>
             <div className="p-5 space-y-3">
               <p className="text-sm text-slate-700">
-                Assign <b>{bulkConfirm.worker.name}</b> ({bulkConfirm.worker.skill}, ₹{bulkConfirm.worker.rate_per_pair}/pair) as the <b>{bulkConfirm.role}</b> karigar on <b>{bulkConfirm.card_count}</b> card(s) currently in <b>{bulkConfirm.stage_label}</b> stage?
+                Assign <b>{bulkConfirm.worker.name}</b> ({bulkConfirm.worker.skill}) as the <b>{bulkConfirm.role}</b> karigar on <b>{bulkConfirm.card_count}</b> card(s) currently in <b>{bulkConfirm.stage_label}</b> stage?
               </p>
-              <p className="text-xs text-slate-500">This will overwrite any existing {bulkConfirm.role} assignment on these cards. The full history is preserved.</p>
+              <div>
+                <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Rate per pair (₹) for these jobs</label>
+                <input type="number" step="0.5" value={bulkConfirm.rate}
+                  onChange={(e) => setBulkConfirm({ ...bulkConfirm, rate: e.target.value })}
+                  className="w-full mt-1 border-2 border-slate-300 px-3 py-2 font-mono text-lg focus:border-[#C27842] focus:outline-none"
+                  data-testid="bulk-rate-input" />
+                <div className="text-[10px] text-slate-500 mt-1">Negotiated rate that will apply to all selected cards. Default is the karigar's standard rate.</div>
+              </div>
+              <p className="text-xs text-slate-500">Overwrites any existing {bulkConfirm.role} assignment on these cards. History preserved.</p>
               <div className="flex gap-2 pt-2 border-t border-slate-200">
                 <BtnPrimary onClick={runBulkAssign} data-testid="bulk-confirm-save"><Check className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Assign to all</BtnPrimary>
                 <BtnSecondary onClick={() => setBulkConfirm(null)}>Cancel</BtnSecondary>
@@ -494,9 +508,14 @@ function ColorGroupCard(props) {
               className={`flex items-center justify-between gap-1 px-2 py-1 border ${a[r.key] ? "border-[#C27842] bg-orange-50" : "border-dashed border-slate-300 bg-white"} hover:border-slate-900 text-left transition-colors`}
             >
               <span className="text-[9px] uppercase tracking-wider font-bold text-slate-500">{r.label}</span>
-              <span className={`text-[10px] font-bold truncate ${a[r.key] ? "text-[#0F172A]" : "text-slate-400 italic"}`}>
-                {a[r.key]?.worker_name || "Assign…"}
-              </span>
+              <div className="text-right">
+                <div className={`text-[10px] font-bold truncate ${a[r.key] ? "text-[#0F172A]" : "text-slate-400 italic"}`}>
+                  {a[r.key]?.worker_name || "Assign…"}
+                </div>
+                {a[r.key]?.rate_per_pair !== undefined && a[r.key]?.rate_per_pair !== null && (
+                  <div className="text-[9px] font-mono text-[#C27842]">₹{a[r.key].rate_per_pair}/pr</div>
+                )}
+              </div>
             </button>
           ))}
         </div>
@@ -546,13 +565,19 @@ function ComponentCell({ label, done, layers, onToggle, disabled }) {
 
 function AssignDialog({ group, role, workers, current, onSave, onClose }) {
   const roleObj = ASSIGNMENT_ROLES.find(r => r.key === role);
-  // Prefer workers of matching skill (or 'general')
-  const matchingSkill = role; // role keys align with skill keys for most
+  const matchingSkill = role;
   const sorted = [...workers].sort((a, b) => {
     const am = (a.skill === matchingSkill || a.skill === "general") ? 0 : 1;
     const bm = (b.skill === matchingSkill || b.skill === "general") ? 0 : 1;
     return am - bm;
   });
+  const [selectedWid, setSelectedWid] = useState(current?.worker_id || "");
+  const [rate, setRate] = useState(current?.rate_per_pair ?? "");
+  const selectedWorker = workers.find(w => w.id === selectedWid);
+  const onPickWorker = (w) => {
+    setSelectedWid(w.id);
+    if (rate === "" || rate === null || rate === undefined) setRate(w.rate_per_pair);
+  };
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" data-testid="assign-dialog">
       <div className="bg-white border-2 border-slate-200 shadow-2xl w-full max-w-md">
@@ -563,15 +588,13 @@ function AssignDialog({ group, role, workers, current, onSave, onClose }) {
           </div>
           <button onClick={onClose} className="p-1 hover:bg-slate-100"><X className="w-5 h-5" /></button>
         </div>
-        <div className="p-5 max-h-[60vh] overflow-y-auto">
+        <div className="p-5 max-h-[55vh] overflow-y-auto">
           {sorted.length === 0 ? (
-            <div className="text-center text-sm text-slate-500 py-8">
-              No karigars yet. Go to <b>Karigars</b> tab and add some first.
-            </div>
+            <div className="text-center text-sm text-slate-500 py-8">No karigars yet.</div>
           ) : (
             <div className="space-y-1.5">
               <button
-                onClick={() => onSave(null)}
+                onClick={() => onSave(null, null)}
                 data-testid="assign-clear"
                 className="w-full text-left px-3 py-2 border border-slate-200 hover:border-red-500 hover:text-red-700 text-xs font-bold uppercase tracking-wider"
               >
@@ -580,20 +603,45 @@ function AssignDialog({ group, role, workers, current, onSave, onClose }) {
               {sorted.map(w => (
                 <button
                   key={w.id}
-                  onClick={() => onSave(w.id)}
+                  onClick={() => onPickWorker(w)}
                   data-testid={`assign-worker-${w.id}`}
-                  className={`w-full text-left px-3 py-2 border ${current?.worker_id === w.id ? "border-[#C27842] bg-orange-50" : "border-slate-200"} hover:border-[#0F172A] flex items-center justify-between`}
+                  className={`w-full text-left px-3 py-2 border ${selectedWid === w.id ? "border-[#C27842] bg-orange-50" : "border-slate-200"} hover:border-[#0F172A] flex items-center justify-between`}
                 >
                   <div>
                     <div className="font-bold text-sm">{w.name}</div>
                     <div className="text-[10px] text-slate-500 uppercase tracking-wider">{w.skill}{w.phone ? ` · ${w.phone}` : ""}</div>
                   </div>
-                  <div className="text-xs font-mono">₹{w.rate_per_pair}/pr</div>
+                  <div className="text-xs font-mono">default ₹{w.rate_per_pair}/pr</div>
                 </button>
               ))}
             </div>
           )}
         </div>
+        {selectedWid && (
+          <div className="px-5 py-4 border-t-2 border-slate-200 bg-slate-50 space-y-3">
+            <div>
+              <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">
+                Rate for THIS style/role (₹/pair) — overrides default
+              </label>
+              <input
+                type="number" step="0.5" value={rate}
+                onChange={(e) => setRate(e.target.value)}
+                placeholder={`Default ₹${selectedWorker?.rate_per_pair || 0}/pair`}
+                data-testid="assign-rate-input"
+                className="w-full mt-1 border-2 border-slate-300 px-3 py-2 font-mono text-lg focus:border-[#C27842] focus:outline-none"
+              />
+              <div className="text-[10px] text-slate-500 mt-1">
+                Different styles can have different rates per role. This is the negotiated rate for this card.
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <BtnPrimary onClick={() => onSave(selectedWid, rate === "" ? null : rate)} data-testid="assign-save">
+                <Check className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Assign at ₹{rate || selectedWorker?.rate_per_pair || 0}/pair
+              </BtnPrimary>
+              <BtnSecondary onClick={onClose}>Cancel</BtnSecondary>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

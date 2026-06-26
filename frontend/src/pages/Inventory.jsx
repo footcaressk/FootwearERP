@@ -9,16 +9,22 @@ const TYPE_COLOR = { in: "green", out: "orange", adjustment: "slate" };
 
 export default function Inventory() {
   const [items, setItems] = useState([]);
+  const [alerts, setAlerts] = useState([]);
   const [filter, setFilter] = useState("");
   const [filterCat, setFilterCat] = useState("");
-  const [open, setOpen] = useState(null); // {type:'in'|'out'|'adjustment', material}
-  const [history, setHistory] = useState(null); // {material_id, name, movements}
+  const [open, setOpen] = useState(null);
+  const [history, setHistory] = useState(null);
   const [materials, setMaterials] = useState([]);
 
   const load = async () => {
-    const [inv, mats] = await Promise.all([http.get("/inventory"), http.get("/materials")]);
+    const [inv, mats, al] = await Promise.all([
+      http.get("/inventory"),
+      http.get("/materials"),
+      http.get("/inventory/alerts"),
+    ]);
     setItems(inv.data);
     setMaterials(mats.data);
+    setAlerts(al.data);
   };
   useEffect(() => { load(); }, []);
 
@@ -62,6 +68,32 @@ export default function Inventory() {
       />
 
       <div className="p-8 space-y-4">
+        {alerts.length > 0 && (
+          <Card className="border-l-4 border-l-red-600 bg-red-50/40 p-4" data-testid="reorder-alerts">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <div className="text-sm font-bold text-red-900 uppercase tracking-wider">
+                  Reorder Alert · {alerts.length} material{alerts.length > 1 ? "s" : ""} at or below minimum stock
+                </div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {alerts.map(a => (
+                    <div key={a.material_id} className="bg-white border border-red-200 px-3 py-1.5 text-xs">
+                      <span className="font-mono font-bold">{a.code}</span>
+                      <span className="text-slate-600 ml-2">{a.name}</span>
+                      <span className="ml-2 font-mono">
+                        <span className="text-red-700 font-bold">{a.balance} {a.unit}</span>
+                        <span className="text-slate-400 mx-1">/</span>
+                        <span className="text-slate-600">{a.reorder_level} min</span>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </Card>
+        )}
+
         <div className="grid grid-cols-3 gap-4">
           <KpiTile label="Materials" value={items.length} accent="#0F172A" />
           <KpiTile label="Stock Value" value={inr(totalValue)} accent="#C27842" />

@@ -178,6 +178,21 @@ class AssignmentUpdate(BaseModel):
     role: str  # cutting | upper | bottom | sole | stitching | lasting | sole_pasting | finishing
     worker_id: Optional[str] = None  # null = unassign
     worker_name: Optional[str] = None  # denormalised for quick display
+    rate_per_pair: Optional[float] = None  # negotiated rate for THIS style/job (overrides worker default)
+
+class BulkAssign(BaseModel):
+    job_ids: List[str]
+    role: str
+    worker_id: Optional[str] = None
+    rate_per_pair: Optional[float] = None
+
+class AdvanceIn(BaseModel):
+    worker_id: str
+    amount: float
+    date: Optional[str] = ""
+    notes: Optional[str] = ""
+
+
 
 class QuantityUpdate(BaseModel):
     quantity: Optional[int] = None
@@ -850,6 +865,12 @@ async def update_job(jid: str, payload: ProductionStageUpdate, request: Request)
         {"_id": oid(jid)},
         {"$set": update, "$push": {"history": history_entry}},
     )
+    # auto-consume inventory when moving OUT of procurement (first time only)
+    if job.get("stage") == "procurement" and payload.stage != "procurement":
+        try:
+            await _auto_consume_inventory(await db.production_jobs.find_one({"_id": oid(jid)}), u["email"])
+        except Exception as e:
+            log.warning(f"Auto-consume inventory failed for job {jid}: {e}")
     return stringify(await db.production_jobs.find_one({"_id": oid(jid)}))
 
 
@@ -876,7 +897,7 @@ async def update_job_components(jid: str, payload: ComponentUpdate, request: Req
 
 @api.patch("/production/jobs/{jid}/assignment")
 async def update_job_assignment(jid: str, payload: AssignmentUpdate, request: Request):
-    """Assign / reassign a karigar to a particular role on a job."""
+    """Assign / reassign a karigar to a particular role on a job with a job-specific rate."""
     u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
     job = await db.production_jobs.find_one({"_id": oid(jid)})
     if not job:
@@ -886,14 +907,21 @@ async def update_job_assignment(jid: str, payload: AssignmentUpdate, request: Re
         worker = await db.workers.find_one({"_id": oid(payload.worker_id)})
         if not worker:
             raise HTTPException(404, "Worker not found")
-        assignments[payload.role] = {"worker_id": payload.worker_id, "worker_name": worker.get("name", "")}
+        rate = payload.rate_per_pair if payload.rate_per_pair is not None else worker.get("rate_per_pair", 0)
+        assignments[payload.role] = {
+            "worker_id": payload.worker_id,
+            "worker_name": worker.get("name", ""),
+            "rate_per_pair": float(rate or 0),
+        }
     else:
         assignments.pop(payload.role, None)
     await db.production_jobs.update_one(
         {"_id": oid(jid)},
         {"$set": {"assignments": assignments, "updated_at": now_iso()},
          "$push": {"history": {"event": "assignment_update", "role": payload.role,
-                               "worker_id": payload.worker_id, "worker_name": assignments.get(payload.role, {}).get("worker_name", ""),
+                               "worker_id": payload.worker_id,
+                               "worker_name": assignments.get(payload.role, {}).get("worker_name", ""),
+                               "rate_per_pair": assignments.get(payload.role, {}).get("rate_per_pair"),
                                "at": now_iso(), "by": u["email"]}}}
     )
     return stringify(await db.production_jobs.find_one({"_id": oid(jid)}))
@@ -1087,11 +1115,14 @@ async def bulk_assign(payload: BulkAssign, request: Request):
     if not payload.job_ids:
         raise HTTPException(400, "job_ids required")
     worker_name = ""
+    rate = float(payload.rate_per_pair or 0)
     if payload.worker_id:
         w = await db.workers.find_one({"_id": oid(payload.worker_id)})
         if not w:
             raise HTTPException(404, "Worker not found")
         worker_name = w.get("name", "")
+        if payload.rate_per_pair is None:
+            rate = float(w.get("rate_per_pair", 0) or 0)
 
     obj_ids = []
     for jid in payload.job_ids:
@@ -1104,7 +1135,10 @@ async def bulk_assign(payload: BulkAssign, request: Request):
     for j in jobs:
         assignments = j.get("assignments") or {}
         if payload.worker_id:
-            assignments[payload.role] = {"worker_id": payload.worker_id, "worker_name": worker_name}
+            assignments[payload.role] = {
+                "worker_id": payload.worker_id, "worker_name": worker_name,
+                "rate_per_pair": rate,
+            }
         else:
             assignments.pop(payload.role, None)
         await db.production_jobs.update_one(
@@ -1112,10 +1146,11 @@ async def bulk_assign(payload: BulkAssign, request: Request):
             {"$set": {"assignments": assignments, "updated_at": now_iso()},
              "$push": {"history": {"event": "bulk_assignment", "role": payload.role,
                                    "worker_id": payload.worker_id, "worker_name": worker_name,
+                                   "rate_per_pair": rate,
                                    "at": now_iso(), "by": u["email"]}}}
         )
         affected += 1
-    return {"affected": affected, "role": payload.role, "worker_id": payload.worker_id, "worker_name": worker_name}
+    return {"affected": affected, "role": payload.role, "worker_id": payload.worker_id, "worker_name": worker_name, "rate_per_pair": rate}
 
 
 # ---------- INVENTORY ----------
@@ -1234,12 +1269,60 @@ async def inventory_shortage(payload: dict, request: Request):
     return {"jobs": req["jobs"], "shortage": rows}
 
 
+# ---------- ADVANCES (worker money taken in advance, deducted from earnings) ----------
+@api.get("/advances")
+async def list_advances(request: Request, worker_id: Optional[str] = None):
+    await get_current_user(request)
+    q = {}
+    if worker_id:
+        q["worker_id"] = worker_id
+    docs = await db.advances.find(q).sort("date", -1).to_list(2000)
+    return [stringify(d) for d in docs]
+
+@api.post("/advances")
+async def create_advance(payload: AdvanceIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    worker = await db.workers.find_one({"_id": oid(payload.worker_id)})
+    if not worker:
+        raise HTTPException(404, "Worker not found")
+    doc = payload.model_dump()
+    doc["worker_name"] = worker.get("name", "")
+    doc["date"] = doc.get("date") or datetime.now(timezone.utc).date().isoformat()
+    doc["settled"] = False
+    doc["by"] = u["email"]
+    doc["created_at"] = now_iso()
+    res = await db.advances.insert_one(doc)
+    doc.pop("_id", None)
+    doc["id"] = str(res.inserted_id)
+    return doc
+
+@api.patch("/advances/{aid}")
+async def update_advance(aid: str, payload: dict, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    update = {}
+    if "settled" in payload:
+        update["settled"] = bool(payload["settled"])
+        update["settled_at"] = now_iso() if payload["settled"] else None
+    if "amount" in payload:
+        update["amount"] = float(payload["amount"])
+    if "notes" in payload:
+        update["notes"] = payload["notes"]
+    await db.advances.update_one({"_id": oid(aid)}, {"$set": update})
+    return stringify(await db.advances.find_one({"_id": oid(aid)}))
+
+@api.delete("/advances/{aid}")
+async def delete_advance(aid: str, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    await db.advances.delete_one({"_id": oid(aid)})
+    return {"ok": True}
+
+
 # ---------- REPORTS – PAYROLL ----------
 @api.get("/reports/payroll")
 async def report_payroll(request: Request, from_date: Optional[str] = None, to_date: Optional[str] = None):
-    """Per-karigar earnings = sum across jobs they're assigned to (per role) of completed_qty × worker rate.
-    If completed_qty == 0 and job is dispatched, use full quantity.
-    Optional date filter on job.updated_at.
+    """Per-karigar earnings using JOB-SPECIFIC rate (set during assignment).
+    Falls back to worker.rate_per_pair if no job-specific rate captured.
+    Subtracts unsettled advances within the period from total earnings → net payable.
     """
     await get_current_user(request)
     workers = await db.workers.find({}).to_list(500)
@@ -1247,14 +1330,13 @@ async def report_payroll(request: Request, from_date: Optional[str] = None, to_d
 
     q = {}
     if from_date:
-        q["updated_at"] = q.get("updated_at", {})
-        q["updated_at"]["$gte"] = from_date
+        q["updated_at"] = {"$gte": from_date}
     if to_date:
-        q["updated_at"] = q.get("updated_at", {})
+        q.setdefault("updated_at", {})
         q["updated_at"]["$lte"] = to_date + "T23:59:59Z"
     jobs = await db.production_jobs.find(q).to_list(5000)
 
-    earnings = {}  # worker_id -> {name, skill, total_pairs, total_earning, by_role:{}, jobs:[]}
+    earnings = {}
     for j in jobs:
         comp = j.get("completed_qty", 0)
         if not comp and j.get("stage") == "dispatched":
@@ -1269,13 +1351,18 @@ async def report_payroll(request: Request, from_date: Optional[str] = None, to_d
             w = worker_map.get(wid)
             if not w:
                 continue
-            rate = float(w.get("rate_per_pair", 0) or 0)
+            # Use job-specific rate if available, else worker default
+            rate = float(a.get("rate_per_pair") if a.get("rate_per_pair") is not None
+                         else w.get("rate_per_pair", 0) or 0)
             earn = rate * comp
             if wid not in earnings:
                 earnings[wid] = {
                     "worker_id": wid, "name": w.get("name", ""), "skill": w.get("skill", ""),
-                    "phone": w.get("phone", ""), "rate_per_pair": rate,
-                    "total_pairs": 0, "total_earning": 0.0, "by_role": {}, "jobs": []
+                    "phone": w.get("phone", ""), "default_rate": float(w.get("rate_per_pair", 0) or 0),
+                    "total_pairs": 0, "total_earning": 0.0,
+                    "advances_taken": 0.0, "advances_open": 0.0,
+                    "net_payable": 0.0,
+                    "by_role": {}, "jobs": [],
                 }
             earnings[wid]["total_pairs"] += comp
             earnings[wid]["total_earning"] += earn
@@ -1283,20 +1370,178 @@ async def report_payroll(request: Request, from_date: Optional[str] = None, to_d
             earnings[wid]["jobs"].append({
                 "po_number": j.get("po_number"), "style_code": j.get("style_code"),
                 "color": j.get("color"), "size": j.get("size"),
-                "role": role, "pairs": comp, "earning": round(earn, 2),
+                "role": role, "pairs": comp, "rate": rate, "earning": round(earn, 2),
             })
 
+    # Aggregate advances per worker (filter by period if dates given)
+    adv_q = {}
+    if from_date:
+        adv_q["date"] = {"$gte": from_date}
+    if to_date:
+        adv_q.setdefault("date", {})
+        adv_q["date"]["$lte"] = to_date
+    advances = await db.advances.find(adv_q).to_list(5000)
+    adv_by_worker = {}
+    for a in advances:
+        wid = a.get("worker_id")
+        if not wid:
+            continue
+        adv_by_worker.setdefault(wid, []).append(a)
+
+    for wid, e in earnings.items():
+        for a in adv_by_worker.get(wid, []):
+            amt = float(a.get("amount", 0) or 0)
+            e["advances_taken"] += amt
+            if not a.get("settled"):
+                e["advances_open"] += amt
+        e["net_payable"] = round(e["total_earning"] - e["advances_open"], 2)
+        e["total_earning"] = round(e["total_earning"], 2)
+        e["advances_taken"] = round(e["advances_taken"], 2)
+        e["advances_open"] = round(e["advances_open"], 2)
+
+    # Also include workers with no earnings but with advances in period
+    for wid, advs in adv_by_worker.items():
+        if wid in earnings:
+            continue
+        w = worker_map.get(wid)
+        if not w:
+            continue
+        taken = sum(float(a.get("amount", 0) or 0) for a in advs)
+        open_amt = sum(float(a.get("amount", 0) or 0) for a in advs if not a.get("settled"))
+        earnings[wid] = {
+            "worker_id": wid, "name": w.get("name", ""), "skill": w.get("skill", ""),
+            "phone": w.get("phone", ""), "default_rate": float(w.get("rate_per_pair", 0) or 0),
+            "total_pairs": 0, "total_earning": 0.0,
+            "advances_taken": round(taken, 2), "advances_open": round(open_amt, 2),
+            "net_payable": round(-open_amt, 2),
+            "by_role": {}, "jobs": [],
+        }
+
     rows = list(earnings.values())
-    for r in rows:
-        r["total_earning"] = round(r["total_earning"], 2)
-    rows.sort(key=lambda r: r["total_earning"], reverse=True)
-    grand_total = round(sum(r["total_earning"] for r in rows), 2)
+    rows.sort(key=lambda r: r["net_payable"], reverse=True)
+    grand = round(sum(r["total_earning"] for r in rows), 2)
+    grand_advances = round(sum(r["advances_open"] for r in rows), 2)
     return {
         "rows": rows,
-        "grand_total": grand_total,
+        "grand_total": grand,
+        "grand_advances_open": grand_advances,
+        "grand_net_payable": round(grand - grand_advances, 2),
         "worker_count": len(rows),
         "from_date": from_date, "to_date": to_date,
     }
+
+
+@api.get("/reports/payroll.pdf")
+async def report_payroll_pdf(request: Request,
+                             from_date: Optional[str] = None,
+                             to_date: Optional[str] = None):
+    """Payroll summary PDF (all karigars in the period)."""
+    await get_current_user(request)
+    data = await report_payroll(request, from_date, to_date)
+    from pdf_payroll import build_payroll_summary
+    pdf_bytes = build_payroll_summary(data)
+    return StreamingResponse(
+        BytesIO(pdf_bytes), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="payroll-{from_date or ""}-{to_date or ""}.pdf"'},
+    )
+
+
+@api.get("/reports/payroll/{worker_id}.pdf")
+async def report_wage_slip_pdf(worker_id: str, request: Request,
+                               from_date: Optional[str] = None,
+                               to_date: Optional[str] = None):
+    """Per-karigar wage slip PDF."""
+    await get_current_user(request)
+    data = await report_payroll(request, from_date, to_date)
+    row = next((r for r in data["rows"] if r["worker_id"] == worker_id), None)
+    if not row:
+        raise HTTPException(404, "No payroll data for this karigar in the period")
+    advances = await db.advances.find({"worker_id": worker_id}).sort("date", -1).to_list(500)
+    advances_list = [stringify(a) for a in advances]
+    from pdf_payroll import build_wage_slip
+    pdf_bytes = build_wage_slip(row, advances_list, data["from_date"], data["to_date"])
+    return StreamingResponse(
+        BytesIO(pdf_bytes), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="wage-slip-{row["name"].replace(" ", "_")}.pdf"'},
+    )
+
+
+# ---------- AUTO INVENTORY CONSUMPTION (on stage transition) ----------
+async def _auto_consume_inventory(job: dict, by_email: str):
+    """When a job advances from procurement → cutting, auto-create stock-out movements
+    for each BOM material based on job's quantity × yield-adjusted consumption.
+    Idempotent: marks job.inventory_consumed=True so we don't double-deduct.
+    """
+    if job.get("inventory_consumed"):
+        return False
+    # Lookup style
+    style = await db.styles.find_one({"code": job.get("style_code")})
+    if not style:
+        return False
+    style_d = stringify(style)
+    pairs = job.get("quantity", 0)
+    if not pairs or not style_d.get("bom"):
+        return False
+    # Build material id lookup by code
+    mat_codes = [b.get("material_code") for b in style_d["bom"]]
+    materials = await db.materials.find({"code": {"$in": mat_codes}}).to_list(500)
+    by_code = {m["code"]: m for m in materials}
+
+    movements = []
+    for b in style_d["bom"]:
+        rate = float(b.get("rate", 0))
+        qty = float(b.get("quantity", 0))
+        yld = float(b.get("yield_per_unit", 1) or 1)
+        waste = float(b.get("waste_pct", 0) or 0)
+        consume = pairs * (qty / yld) * (1 + waste / 100)
+        if consume <= 0:
+            continue
+        mat = by_code.get(b.get("material_code"))
+        if not mat:
+            continue
+        movements.append({
+            "material_id": str(mat["_id"]),
+            "material_code": mat.get("code"),
+            "material_name": mat.get("name"),
+            "unit": mat.get("unit"),
+            "type": "out",
+            "quantity": round(consume, 4),
+            "rate": rate,
+            "party": f"Job {job.get('po_number','')} · {job.get('style_code','')} · {job.get('color','')} · Sz {job.get('size','')}",
+            "job_id": str(job["_id"]),
+            "notes": "Auto-consumed when stage moved past Procurement",
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "by": by_email,
+            "created_at": now_iso(),
+            "auto": True,
+        })
+    if movements:
+        await db.inventory_movements.insert_many(movements)
+        await db.production_jobs.update_one(
+            {"_id": job["_id"]},
+            {"$set": {"inventory_consumed": True, "inventory_consumed_at": now_iso()}}
+        )
+        return True
+    return False
+
+
+@api.get("/inventory/alerts")
+async def inventory_alerts(request: Request):
+    """List materials whose balance <= reorder_level."""
+    await get_current_user(request)
+    inv_rows = await list_inventory(request)
+    alerts = []
+    materials = await db.materials.find({}).to_list(2000)
+    rl = {str(m["_id"]): float(m.get("reorder_level", 0) or 0) for m in materials}
+    for r in inv_rows:
+        threshold = rl.get(r["material_id"], 0)
+        if threshold > 0 and r["balance"] <= threshold:
+            alerts.append({**r, "reorder_level": threshold, "shortfall": round(threshold - r["balance"], 2)})
+    alerts.sort(key=lambda x: x["balance"])
+    return alerts
+
+
+
 
 
 # ---------- DEFECTS ----------

@@ -6,7 +6,7 @@ import { Plus, Trash2, Pencil, X, Save } from "lucide-react";
 const CATEGORIES = ["upper", "sole", "lining", "accessory", "consumable", "packing", "other"];
 const UNITS = ["sqft", "pcs", "kg", "gm", "ltr", "ml", "mtr", "set"];
 
-const emptyForm = { code: "", name: "", category: "upper", unit: "sqft", rate: 0, notes: "" };
+const emptyForm = { code: "", name: "", category: "upper", unit: "sqft", rate: 0, reorder_level: 0, notes: "" };
 
 export default function Materials() {
   const [items, setItems] = useState([]);
@@ -23,9 +23,9 @@ export default function Materials() {
   useEffect(() => { load(); }, []);
 
   const startNew = () => { setEdit(null); setForm(emptyForm); setOpen(true); };
-  const startEdit = (m) => { setEdit(m.id); setForm({ code: m.code, name: m.name, category: m.category, unit: m.unit, rate: m.rate, notes: m.notes || "" }); setOpen(true); };
+  const startEdit = (m) => { setEdit(m.id); setForm({ code: m.code, name: m.name, category: m.category, unit: m.unit, rate: m.rate, reorder_level: m.reorder_level || 0, notes: m.notes || "" }); setOpen(true); };
   const save = async () => {
-    const body = { ...form, rate: Number(form.rate) };
+    const body = { ...form, rate: Number(form.rate), reorder_level: Number(form.reorder_level || 0) };
     if (edit) await http.patch(`/materials/${edit}`, body); else await http.post("/materials", body);
     setOpen(false); load();
   };
@@ -112,6 +112,7 @@ export default function Materials() {
               </Select>
             </div>
             <Input label="Rate (INR)" type="number" step="0.01" value={form.rate} onChange={(e) => setForm({ ...form, rate: e.target.value })} testId="form-mat-rate" />
+            <Input label="Reorder Level (min stock)" type="number" step="0.5" value={form.reorder_level} onChange={(e) => setForm({ ...form, reorder_level: e.target.value })} testId="form-mat-reorder" />
             <Input label="Notes" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
             <div className="flex gap-2 pt-3">
               <BtnPrimary onClick={save} data-testid="save-material-btn"><Save className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Save</BtnPrimary>
