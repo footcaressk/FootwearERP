@@ -151,6 +151,30 @@ def build_default_packing_list(po: dict, options: dict | None = None) -> bytes:
     ws.merge_cells("P14:Q14")
     _set(ws, "P14", carton_dim, bold=True, size=10, border=True, align="center")
 
+    # ---- Optional shipping / dispatch metadata (row 15) ----
+    shipping_pairs = [
+        ("DISPATCH DATE", options.get("dispatch_date") or ""),
+        ("TRANSPORTER", options.get("transporter") or ""),
+        ("VEHICLE NO", options.get("vehicle_no") or ""),
+        ("DRIVER", options.get("driver_name") or ""),
+        ("DRIVER PH", options.get("driver_phone") or ""),
+        ("DESTINATION", options.get("destination") or ""),
+    ]
+    show_shipping = any(v for _, v in shipping_pairs)
+    if show_shipping:
+        col_idx = 1
+        for label, val in shipping_pairs:
+            if not val:
+                continue
+            lab_col = get_column_letter(col_idx)
+            val_col = get_column_letter(col_idx + 1)
+            _set(ws, f"{lab_col}15", label, bold=True, size=8, fill=_LIGHT, color=_ACCENT, align="left", border=True)
+            _set(ws, f"{val_col}15", val, bold=True, size=9, border=True, align="left")
+            col_idx += 2
+            if col_idx > 16:
+                break
+        ws.row_dimensions[15].height = 22
+
     # ---- Line-item header row (row 16) ----
     headers = ["SITE CODE", "STYLE", "COLOUR", "CTN .NO"] + sizes + ["PCS/CTN", "PER CARTON", "TTL CTN", "TOTAL PCS", "NET WT", "GROSS WT"]
     # Make sure we extend to column Q max; if not enough cols, append blanks
@@ -160,12 +184,18 @@ def build_default_packing_list(po: dict, options: dict | None = None) -> bytes:
         _set(ws, f"{col}16", h, bold=True, size=9, fill=_DARK, color="FFFFFF", align="center", border=True)
     ws.row_dimensions[16].height = 28
 
-    # ---- Lines (rows 17+, one per non-zero PO line by (style,color)) ----
-    # Aggregate quantities per (style_code, color) across sizes
-    agg: dict[tuple[str, str], dict] = {}
+    # ---- Lines (rows 17+, one per non-zero PO line by (PO, style, color)) ----
+    # When line items carry a `_po_number` field (merged + sectioned), we keep
+    # them grouped per PO. Aggregate quantities per (po_number, style_code, color)
+    # across sizes.
+    agg: dict[tuple[str, str, str], dict] = {}
     for li in po.get("line_items", []):
-        key = (li.get("style_code", ""), li.get("color", ""))
-        slot = agg.setdefault(key, {"style": key[0], "color": key[1], "by_size": {s: 0 for s in sizes}, "total": 0})
+        po_num = li.get("_po_number", "")  # blank for single-PO packing lists
+        key = (po_num, li.get("style_code", ""), li.get("color", ""))
+        slot = agg.setdefault(key, {
+            "po_number": po_num, "style": key[1], "color": key[2],
+            "by_size": {s: 0 for s in sizes}, "total": 0,
+        })
         sz = str(li.get("size", "")).strip()
         qty = int(li.get("quantity") or 0)
         if sz in slot["by_size"]:
@@ -183,9 +213,21 @@ def build_default_packing_list(po: dict, options: dict | None = None) -> bytes:
 
     row_idx = 17
     ctn_seq = 1
-    for (_, _), rec in agg.items():
+    last_po = None
+    site_code = options.get("site_code") or po.get("site_code", "")
+    total_cols_for_section = 4 + n_size_cols + 6  # SITE..GROSS_WT
+    for key, rec in agg.items():
+        # Insert a PO section header row when the PO number changes (merged + sectioned only)
+        if rec.get("po_number") and rec["po_number"] != last_po:
+            last_po = rec["po_number"]
+            end_col = get_column_letter(total_cols_for_section)
+            ws.merge_cells(f"A{row_idx}:{end_col}{row_idx}")
+            _set(ws, f"A{row_idx}", f"PO: {last_po}", bold=True, size=10,
+                 fill=_ACCENT, color="FFFFFF", align="left", border=True)
+            ws.row_dimensions[row_idx].height = 20
+            row_idx += 1
         cartons_here = max(1, (rec["total"] + pcs_per_box - 1) // pcs_per_box)
-        _set(ws, f"A{row_idx}", po.get("site_code", "—"), size=9, align="center", border=True)
+        _set(ws, f"A{row_idx}", site_code or "—", size=9, align="center", border=True)
         _set(ws, f"B{row_idx}", rec["style"], size=9, bold=True, align="left", border=True)
         _set(ws, f"C{row_idx}", rec["color"], size=9, align="left", border=True)
         _set(ws, f"D{row_idx}", str(ctn_seq), size=9, align="center", border=True)
@@ -243,6 +285,25 @@ def build_default_packing_list(po: dict, options: dict | None = None) -> bytes:
         tot_col = get_column_letter(size_start_col_idx + n_size_cols)
         _set(ws, f"{tot_col}{r}", f"=SUM({get_column_letter(size_start_col_idx)}{r}:{get_column_letter(size_start_col_idx + n_size_cols - 1)}{r})", bold=True, size=9, fill=_LIGHT, align="center", border=True)
 
+    # ---- Notes / Port footer ----
+    notes = options.get("notes") or ""
+    port = options.get("port") or ""
+    if notes or port:
+        notes_row = s_row + 6
+        end_col = get_column_letter(min(max_cols, 17))
+        if port:
+            _set(ws, f"A{notes_row}", "PORT:", bold=True, size=9, fill=_LIGHT, color=_ACCENT, border=True)
+            ws.merge_cells(f"B{notes_row}:D{notes_row}")
+            _set(ws, f"B{notes_row}", port, bold=True, size=10, border=True)
+            notes_row += 1
+        if notes:
+            _set(ws, f"A{notes_row}", "NOTES:", bold=True, size=9, fill=_LIGHT, color=_ACCENT, border=True, align="left")
+            ws.merge_cells(f"B{notes_row}:{end_col}{notes_row + 2}")
+            _set(ws, f"B{notes_row}", notes, size=9, border=True, align="left")
+            ws.row_dimensions[notes_row].height = 24
+            ws.row_dimensions[notes_row + 1].height = 24
+            ws.row_dimensions[notes_row + 2].height = 24
+
     # Column widths
     for col_idx in range(1, max_cols + 1):
         letter = get_column_letter(col_idx)
@@ -287,6 +348,16 @@ def build_from_template(template_bytes: bytes, po: dict, options: dict | None = 
         "date": today,
         "total_pcs": total_qty,
         "total_cartons": total_cartons,
+        # Manual / shipping fields
+        "dispatch_date": options.get("dispatch_date", ""),
+        "transporter": options.get("transporter", ""),
+        "vehicle_no": options.get("vehicle_no", ""),
+        "driver_name": options.get("driver_name", ""),
+        "driver_phone": options.get("driver_phone", ""),
+        "site_code": options.get("site_code", ""),
+        "destination": options.get("destination", ""),
+        "port": options.get("port", ""),
+        "notes": options.get("notes", ""),
     }
 
     for ws in wb.worksheets:

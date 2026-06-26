@@ -137,8 +137,9 @@ def _parse_meta(text: str) -> dict:
     po_date = _normalise_date(_find_first(r"(?:PO\s*Date|Order\s*Date|Date)[\s:\-|]+(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", text))
     delivery_date = _normalise_date(_find_first(r"(?:Delivery|Ship(?:ment)?|Due)\s*Date[\s:\-|]+(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", text))
 
-    # Client / vendor — anchor on full word labels (avoid matching "To" inside "Total" or "Article")
-    # Separator can be any combination of colon, dash, pipe, whitespace.
+    # Client / Buyer detection (tries in order):
+    #   1. Explicit "Bill To" / "Buyer" / "Customer" label
+    #   2. First non-empty line above the "PURCHASE ORDER" title (corporate header)
     client_name = ""
     for pat in [
         r"\b(?:Bill\s*To|Buyer|Customer|Consignee|Destination)(?:\s*Name)?\s*[\s:\-|]+\s*([A-Z][A-Za-z0-9 .,&'\-]{3,80})",
@@ -146,16 +147,46 @@ def _parse_meta(text: str) -> dict:
         m = re.search(pat, text, flags=re.I)
         if m:
             client_name = _norm(m.group(1))
-            break
+            # Filter out garbage like "VijayakanthJ ForSHEIN..."  (no spaces, camel-case run-ons)
+            if " " in client_name and not re.search(r"\bSELLER\b|\bSignature\b|For[A-Z]{3,}", client_name, re.I):
+                break
+            client_name = ""
 
+    if not client_name:
+        # Look for the first ALL-CAPS line before "PURCHASE ORDER"
+        lines = [_norm(ln) for ln in text.splitlines()]
+        po_title_idx = next((i for i, ln in enumerate(lines) if re.search(r"PURCHASE\s*ORDER", ln, re.I)), -1)
+        if po_title_idx > 0:
+            for i in range(po_title_idx - 1, -1, -1):
+                ln = lines[i]
+                # Heuristic: a corporate name is upper-case-heavy, 4+ chars, contains a space or known suffix
+                if (re.match(r"^[A-Z][A-Z0-9 &.,'\-/]{4,80}$", ln)
+                        and any(k in ln.upper() for k in ["LIMITED", "LIMITED.", "LTD", "LLP", "PVT", "PRIVATE", "INC", "CO.", "CORP", "COMPANY"])):
+                    client_name = ln
+                    break
+                if i == 0 and ln and ln.isupper():
+                    client_name = ln
+                    break
+
+    # Vendor / seller detection — strongest signal first: line after "Vendor Code : <digits>"
     vendor_name = ""
-    for pat in [
-        r"\b(?:Vendor|Supplier|Sold\s*By|Seller)(?:\s*Name)?\s*[\s:\-|]+\s*([A-Z][A-Za-z0-9 .,&'\-]{3,80})",
-    ]:
-        m = re.search(pat, text, flags=re.I)
-        if m:
-            vendor_name = _norm(m.group(1))
-            break
+    m = re.search(r"Vendor\s*Code\s*[:\-|]\s*\d+[^\n]*\n([A-Z][A-Z0-9 &.,'\-/]{4,80})", text, flags=re.I)
+    if m:
+        vendor_name = _norm(m.group(1))
+
+    if not vendor_name:
+        for pat in [
+            r"\b(?:Vendor|Supplier|Sold\s*By)(?:\s*Name)?\s*[\s:\-|]+\s*([A-Z][A-Za-z0-9 .,&'\-]{3,80})",
+            r"\bSeller(?:\s*Name)?\s*[\s:\-|]+\s*([A-Z][A-Za-z0-9 .,&'\-]{3,80})",
+        ]:
+            m = re.search(pat, text, flags=re.I)
+            if m:
+                cand = _norm(m.group(1))
+                # Reject template/cover words
+                if (" " in cand
+                        and not re.search(r"\b(DRAFT|PURCHASE|ORDER|CODE|ACCEPT|SIGN|TITLE|DATE)\b", cand, re.I)):
+                    vendor_name = cand
+                    break
 
     return {
         "po_number": po_no or "",
@@ -175,54 +206,104 @@ def _parse_meta(text: str) -> dict:
 
 # ---------- line-item table detection ----------
 _HEADER_TOKENS = {
-    "style": ["style", "article", "model", "item code", "sku"],
-    "description": ["description", "particulars", "item name", "product"],
+    "style": ["style", "article", "articleno", "article no", "model", "item code", "sku"],
+    "description": ["description", "particulars", "item name", "product", "materialdescription", "material description"],
     "color": ["color", "colour", "shade"],
     "size": ["size", "uk size"],
-    "hsn": ["hsn", "sac", "hsn code"],
+    "hsn": ["hsn", "sac", "hsn code", "hsncode"],
     "quantity": ["quantity", "qty", "pcs", "pairs"],
-    "unit_price": ["rate", "unit price", "price", "mrp", "unit rate"],
-    "amount": ["amount", "total", "value", "net amount"],
+    "unit_price": ["basecost", "base cost", "rate", "unit price", "unit rate"],
+    "mrp": ["mrp"],
+    "amount": ["totalbasevalue", "total base value", "amount", "total value", "net amount", "totalvalue"],
 }
+
+# Junk tokens we never want as a field
+_HEADER_JUNK = {"sr.no", "sr no", "srno", "sr", "no", "uom", "ean", "ean no", "eanno",
+                "vendoritemno", "vendor item no", "vendor article no", "vendorarticleno",
+                "site", "deliverydate", "delivery date", "cess", "cess(%)", "cessfxdrt",
+                "cessfxdvl", "igst", "igst(%)", "cgst", "sgst", "cgst(%)", "sgst(%)"}
 
 
 def _classify_header(cell: str) -> str | None:
     s = _norm(cell).lower()
+    if not s or s in _HEADER_JUNK:
+        return None
     for key, candidates in _HEADER_TOKENS.items():
         for c in candidates:
-            if c == s or (len(s) <= 18 and c in s):
+            if c == s or (len(s) <= 22 and c in s):
                 return key
     return None
 
 
+def _split_color_size_from_desc(desc: str) -> tuple[str, str, str]:
+    """If `desc` has comma-separated trailing pieces, take the last as size,
+    second-to-last as color, the rest as description.
+
+    Returns (description, color, size). Never raises."""
+    if not desc:
+        return "", "", ""
+    parts = [p.strip() for p in desc.split(",")]
+    if len(parts) >= 3:
+        return ",".join(parts[:-2]).strip(), parts[-2], parts[-1]
+    if len(parts) == 2:
+        return parts[0], parts[1], ""
+    return desc, "", ""
+
+
 def _parse_line_items_from_tables(tables: list, po_no: str) -> list[dict]:
+    """Detect header row in each table. Handles multi-line cells where one
+    visual cell contains multiple stacked sub-headers (eg. SHEIN's
+    ``ArticleNo./HSNCode`` cell). For data rows, the corresponding sub-line is
+    extracted from the same column."""
     items: list[dict] = []
     for tbl in tables:
-        # Find header row (one with most recognised tokens)
+        # Identify header row by counting classified sub-tokens in the first ~5 rows
         best_idx = -1
         best_score = 0
-        best_map = {}
-        for i, row in enumerate(tbl[:5]):  # header usually in first 5 rows
-            classes = [_classify_header(c) for c in row]
-            score = sum(1 for c in classes if c)
+        # (col_idx, line_idx) -> field
+        best_map: dict[tuple[int, int], str] = {}
+        for i, row in enumerate(tbl[:6]):
+            sub_classes: dict[tuple[int, int], str] = {}
+            for j, cell in enumerate(row):
+                if cell is None:
+                    continue
+                for li, sub in enumerate(str(cell).splitlines()):
+                    cls = _classify_header(sub)
+                    if cls and (j, li) not in sub_classes:
+                        sub_classes[(j, li)] = cls
+            score = len(sub_classes)
             if score > best_score:
-                best_score, best_idx = score, i
-                best_map = {j: c for j, c in enumerate(classes) if c}
+                best_score, best_idx, best_map = score, i, sub_classes
         if best_score < 2 or best_idx < 0:
             continue
 
+        # Iterate data rows
         for row in tbl[best_idx + 1:]:
             if not row or all((c is None or str(c).strip() == "") for c in row):
                 continue
+            # Skip subtotal / footer-style rows
+            first_cell = _norm(row[0]) if len(row) and row[0] is not None else ""
+            if re.search(r"sub\s*total|grand\s*total|total\s*[a-z]", first_cell, re.I):
+                continue
+
             rec = {"style_code": "", "description": "", "color": "", "size": "",
-                   "hsn_code": "", "quantity": 0, "unit_price": 0.0, "amount": 0.0, "mrp": ""}
-            for j, key in best_map.items():
-                if j >= len(row):
+                   "hsn_code": "", "quantity": 0, "unit_price": 0.0,
+                   "amount": 0.0, "mrp": ""}
+
+            for (col_idx, line_idx), key in best_map.items():
+                if col_idx >= len(row):
                     continue
-                val = row[j]
+                val = row[col_idx]
                 if val is None:
                     continue
-                sval = _norm(val)
+                # Pick the corresponding sub-line of the data cell
+                lines = str(val).splitlines()
+                if line_idx < len(lines):
+                    sval = _norm(lines[line_idx])
+                else:
+                    sval = _norm(val)
+                if not sval:
+                    continue
                 if key == "style":
                     rec["style_code"] = sval
                 elif key == "description":
@@ -237,9 +318,22 @@ def _parse_line_items_from_tables(tables: list, po_no: str) -> list[dict]:
                     rec["quantity"] = _to_int(sval)
                 elif key == "unit_price":
                     rec["unit_price"] = _to_number(sval)
+                elif key == "mrp":
+                    rec["mrp"] = sval
                 elif key == "amount":
                     rec["amount"] = _to_number(sval)
-            # Filter rows: must have a non-empty style + positive qty + positive price
+
+            # If description holds color+size embedded (eg. "SHEINWOMEN...,BLACK,3")
+            # and color/size are still empty, split them out.
+            if rec["description"] and not (rec["color"] and rec["size"]):
+                desc, color, size = _split_color_size_from_desc(rec["description"])
+                if size and not rec["size"]:
+                    rec["size"] = size
+                if color and not rec["color"]:
+                    rec["color"] = color
+                rec["description"] = desc or rec["description"]
+
+            # Accept the row only if it has a positive qty + price + identifier
             if rec["quantity"] > 0 and rec["unit_price"] > 0 and (rec["style_code"] or rec["description"]):
                 if not rec["hsn_code"]:
                     rec["hsn_code"] = _HSN_CODES_FOOTWEAR
@@ -279,8 +373,21 @@ def _finalise_totals(data: dict, full_text: str) -> None:
     # Try to detect explicit tax info
     cgst_amt = _to_number(_find_first(r"CGST[^\d-]*([0-9.,]+)", full_text))
     sgst_amt = _to_number(_find_first(r"SGST[^\d-]*([0-9.,]+)", full_text))
-    igst_amt = _to_number(_find_first(r"IGST[^\d-]*([0-9.,]+)", full_text))
-    grand    = _to_number(_find_first(r"(?:Grand\s*Total|Total\s*Amount|Net\s*Payable)[^\d-]*([0-9.,]+)", full_text))
+    igst_amt = _to_number(_find_first(r"\bTOTAL\s*IGST[\s:\-|]+(?:INR|Rs\.?)?[\s]*([0-9][0-9.,]+)", full_text))
+    if not igst_amt:
+        igst_amt = _to_number(_find_first(r"\bIGST[^\d-]*([0-9.,]+)", full_text))
+
+    # Grand-total — try several variants in order of specificity
+    grand = 0.0
+    for pat in [
+        r"Total\s*Order\s*Value\s*[:\-]?\s*(?:INR|Rs\.?)?\s*([0-9][0-9,]+(?:\.\d+)?)",
+        r"TOTAL\s*BASIC\s*VALUE\s*(?:INR|Rs\.?)?\s*([0-9][0-9,]+(?:\.\d+)?)",
+        r"(?:Grand\s*Total|Net\s*Payable|Total\s*Amount|Net\s*Value)\s*[:\-]?\s*(?:INR|Rs\.?)?\s*([0-9][0-9,]+(?:\.\d+)?)",
+    ]:
+        m = re.search(pat, full_text, flags=re.I)
+        if m:
+            grand = _to_number(m.group(1))
+            break
 
     data["subtotal"] = round(subtotal, 2)
     data["total_quantity"] = total_qty

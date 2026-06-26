@@ -116,17 +116,21 @@ export default function Production() {
   const [viewArchive, setViewArchive] = useState(false);
   const [archivedJobs, setArchivedJobs] = useState([]);
   const [detailFor, setDetailFor] = useState(null);
+  const [packingFor, setPackingFor] = useState(null); // {kind:'single'|'merged', group?, jobs?}
+  const [savedPackingLists, setSavedPackingLists] = useState([]);
   const { user } = useAuth();
   const canEdit = ["admin", "manager", "production"].includes(user?.role);
 
   const load = async () => {
-    const [j, w, s, ar] = await Promise.all([
+    const [j, w, s, ar, pl] = await Promise.all([
       http.get("/production/jobs"),
       http.get("/workers"),
       http.get("/styles"),
       http.get("/production/archive"),
+      http.get("/packing-lists"),
     ]);
-    setJobs(j.data); setWorkers(w.data); setStyles(s.data); setArchivedJobs(ar.data);
+    setJobs(j.data); setWorkers(w.data); setStyles(s.data);
+    setArchivedJobs(ar.data); setSavedPackingLists(pl.data || []);
   };
   useEffect(() => { load(); }, []);
 
@@ -144,25 +148,59 @@ export default function Production() {
     } catch (e) { alert("Print failed: " + (e.response?.data?.detail || e.message)); }
   };
 
-  // Generate packing list for this single (PO, style, color) group.
-  // After generation, jobs are flagged `packing_generated_at`; if invoice is
-  // already done they auto-archive and disappear from the active board.
-  const downloadGroupPacking = async (group) => {
+  // Open packing list modal for a single group OR a merged set of jobs.
+  const openPackingForGroup = (group) => setPackingFor({ kind: "single", group });
+  const openPackingMerged = () => {
+    const groupsArr = Object.values(selected);
+    if (!groupsArr.length) return;
+    const jobIds = new Set(groupsArr.flatMap(g => g.rows.map(r => r.id)));
+    const jobsFlat = jobs.filter(j => jobIds.has(j.id));
+    setPackingFor({ kind: "merged", jobs: jobsFlat });
+  };
+
+  // Submit the modal — actually generate + download + persist.
+  const submitPacking = async (form) => {
     try {
-      const res = await http.post("/packing-lists/job",
-        { po_id: group.po_id, job_ids: group.rows.map(r => r.id) },
-        { responseType: "blob" });
-      const url = URL.createObjectURL(new Blob([res.data], {
-        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      }));
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `PackingList-${group.po_number}-${group.style_code}-${(group.color || "color").replace(/\s+/g, "")}.xlsx`;
-      document.body.appendChild(a); a.click(); a.remove();
-      URL.revokeObjectURL(url);
+      if (packingFor.kind === "single") {
+        const g = packingFor.group;
+        const res = await http.post("/packing-lists/job",
+          { po_id: g.po_id, job_ids: g.rows.map(r => r.id), ...form },
+          { responseType: "blob" });
+        triggerDownload(res.data, `PackingList-${g.po_number}-${g.style_code}-${(g.color || "color").replace(/\s+/g, "")}.xlsx`);
+      } else {
+        const job_ids = packingFor.jobs.map(j => j.id);
+        const res = await http.post("/packing-lists/merged",
+          { job_ids, ...form },
+          { responseType: "blob" });
+        triggerDownload(res.data, `PackingList-MERGED-${new Date().toISOString().slice(0, 10)}.xlsx`);
+      }
+      setPackingFor(null);
       load();
     } catch (e) {
       alert("Packing list failed: " + (e.response?.data?.detail || e.message));
+    }
+  };
+
+  const triggerDownload = (blobData, filename) => {
+    const blob = new Blob([blobData], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const reDownloadSavedPacking = async (pl) => {
+    try {
+      const res = await http.get(`/packing-lists/${pl.id}/file`, { responseType: "blob" });
+      const fname = pl.merged
+        ? `PackingList-MERGED-${(pl.created_at || "").slice(0, 10)}.xlsx`
+        : `PackingList-${pl.po_number}-${(pl.created_at || "").slice(0, 10)}.xlsx`;
+      triggerDownload(res.data, fname);
+    } catch (e) {
+      alert("Download failed: " + (e.response?.data?.detail || e.message));
     }
   };
 
@@ -347,6 +385,13 @@ export default function Production() {
                 {merging ? "..." : `Merge Invoice (${dispatchedCount})`}
               </BtnPrimary>
             )}
+            {dispatchedCount > 0 && (
+              <BtnPrimary onClick={openPackingMerged} data-testid="merged-packing-btn"
+                className="bg-[#16A34A] border-[#16A34A] hover:bg-[#0F7A36]">
+                <Package className="w-3.5 h-3.5 inline -mt-0.5 mr-1" />
+                Merge Packing ({dispatchedCount})
+              </BtnPrimary>
+            )}
           </div>
         }
       />
@@ -357,8 +402,10 @@ export default function Production() {
             jobs={archivedJobs}
             styleByCode={styleByCode}
             onPrint={printCard}
-            onPacking={downloadGroupPacking}
+            onPacking={openPackingForGroup}
             onViewDetails={(g) => setDetailFor(g)}
+            savedPackingLists={savedPackingLists}
+            onReDownloadPacking={reDownloadSavedPacking}
           />
         ) : (
         <div className="overflow-x-auto pb-4">
@@ -410,7 +457,7 @@ export default function Production() {
                         onOpenQty={(rowId) => setQtyFor({ group: g, rowId })}
                         onPrint={() => printCard(g)}
                         onWhatsApp={() => setWaFor({ group: g })}
-                        onPacking={() => downloadGroupPacking(g)}
+                        onPacking={() => openPackingForGroup(g)}
                         isProc={isProc}
                         isDispatched={isDisp}
                         onMatReq={() => downloadMaterialRequirement([g], `${g.style_code} · ${g.color}`)}
@@ -494,6 +541,14 @@ export default function Production() {
 
       {detailFor && (
         <DetailModal group={detailFor} onClose={() => setDetailFor(null)} />
+      )}
+
+      {packingFor && (
+        <PackingListDialog
+          payload={packingFor}
+          onClose={() => setPackingFor(null)}
+          onSubmit={submitPacking}
+        />
       )}
 
       {bulkConfirm && (
@@ -965,69 +1020,121 @@ function WhatsAppDialog({ group, workers, onClose, onSend }) {
 
 
 /* -------------------- ARCHIVE PANEL -------------------- */
-function ArchivePanel({ jobs, styleByCode, onPrint, onPacking, onViewDetails }) {
+function ArchivePanel({ jobs, styleByCode, onPrint, onPacking, onViewDetails, savedPackingLists, onReDownloadPacking }) {
   const groups = groupJobsByColor(jobs);
-  if (groups.length === 0) {
-    return (
-      <Card className="p-12 text-center text-slate-400 text-sm" data-testid="archive-empty">
-        Nothing archived yet — once both <b>Invoice</b> and <b>Packing List</b> are generated for a card it moves here automatically.
-      </Card>
-    );
-  }
   return (
-    <div className="space-y-3" data-testid="archive-list">
+    <div className="space-y-5" data-testid="archive-list">
       <Card className="bg-slate-50 border-2 border-slate-200 p-4">
         <div className="flex items-baseline justify-between">
           <div>
             <h2 className="text-lg font-bold flex items-center gap-2"><Archive className="w-4 h-4 text-slate-700" /> Archived Production Cards</h2>
-            <p className="text-xs text-slate-600 mt-1">These groups have both invoice + packing list generated. Click <b>View details</b> to inspect the full production history.</p>
+            <p className="text-xs text-slate-600 mt-1">Cards that have both invoice + packing list generated land here. Click <b>View details</b> to inspect full production history.</p>
           </div>
           <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">
-            {groups.length} group{groups.length > 1 ? "s" : ""} · {jobs.length} job{jobs.length > 1 ? "s" : ""}
+            {groups.length} group{groups.length !== 1 ? "s" : ""} · {jobs.length} job{jobs.length !== 1 ? "s" : ""}
           </div>
         </div>
       </Card>
-      <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4" data-testid="archive-grid">
-        {groups.map(g => (
-          <Card key={g.key} className="border-l-4 border-slate-400 hover:border-[#0F172A] transition-colors" data-testid={`archive-card-${g.key}`}>
-            {styleByCode[g.style_code]?.image_url && (
-              <div className="h-32 overflow-hidden bg-slate-100">
-                <img src={styleByCode[g.style_code].image_url} alt="" className="w-full h-full object-cover" />
-              </div>
-            )}
-            <div className="p-4">
-              <div className="flex items-baseline justify-between mb-2">
-                <div>
-                  <div className="font-mono text-xs text-slate-500">PO {g.po_number}</div>
-                  <div className="font-bold text-base">{g.style_code}</div>
+
+      {groups.length === 0 ? (
+        <Card className="p-12 text-center text-slate-400 text-sm" data-testid="archive-empty">
+          Nothing archived yet — once both <b>Invoice</b> and <b>Packing List</b> are generated for a card it moves here automatically.
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4" data-testid="archive-grid">
+          {groups.map(g => (
+            <Card key={g.key} className="border-l-4 border-slate-400 hover:border-[#0F172A] transition-colors" data-testid={`archive-card-${g.key}`}>
+              {styleByCode[g.style_code]?.image_url && (
+                <div className="h-32 overflow-hidden bg-slate-100">
+                  <img src={styleByCode[g.style_code].image_url} alt="" className="w-full h-full object-cover" />
                 </div>
-                <div className="text-right">
-                  <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">{g.color}</div>
-                  <div className="font-mono font-bold text-lg text-[#C27842]">{g.totalQty}</div>
+              )}
+              <div className="p-4">
+                <div className="flex items-baseline justify-between mb-2">
+                  <div>
+                    <div className="font-mono text-xs text-slate-500">PO {g.po_number}</div>
+                    <div className="font-bold text-base">{g.style_code}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">{g.color}</div>
+                    <div className="font-mono font-bold text-lg text-[#C27842]">{g.totalQty}</div>
+                  </div>
+                </div>
+                <div className="text-xs text-slate-600 mb-1">
+                  <span className="font-bold uppercase tracking-wider text-[10px] text-slate-500">Client:</span> {g.client_name}
+                </div>
+                <div className="text-xs text-slate-600 mb-3">
+                  <span className="font-bold uppercase tracking-wider text-[10px] text-slate-500">Sizes:</span>{" "}
+                  <span className="font-mono">{g.sizes.join(" · ")}</span>
+                </div>
+                <div className="flex gap-1 flex-wrap pt-2 border-t border-slate-200">
+                  <button onClick={() => onViewDetails(g)} className="text-[10px] uppercase tracking-wider font-bold text-white bg-[#2563EB] hover:bg-[#1E40AF] px-2 py-1 flex items-center gap-1" data-testid={`archive-details-${g.key}`}>
+                    <Eye className="w-3 h-3" /> View details
+                  </button>
+                  <button onClick={() => onPrint(g)} className="text-[10px] uppercase tracking-wider font-bold text-slate-700 border border-slate-300 hover:bg-slate-900 hover:text-white px-2 py-1 flex items-center gap-1">
+                    <Printer className="w-3 h-3" /> Card PDF
+                  </button>
+                  <button onClick={() => onPacking(g)} className="text-[10px] uppercase tracking-wider font-bold text-[#16A34A] border border-[#16A34A] hover:bg-[#16A34A] hover:text-white px-2 py-1 flex items-center gap-1">
+                    <Package className="w-3 h-3" /> Packing
+                  </button>
                 </div>
               </div>
-              <div className="text-xs text-slate-600 mb-1">
-                <span className="font-bold uppercase tracking-wider text-[10px] text-slate-500">Client:</span> {g.client_name}
-              </div>
-              <div className="text-xs text-slate-600 mb-3">
-                <span className="font-bold uppercase tracking-wider text-[10px] text-slate-500">Sizes:</span>{" "}
-                <span className="font-mono">{g.sizes.join(" · ")}</span>
-              </div>
-              <div className="flex gap-1 flex-wrap pt-2 border-t border-slate-200">
-                <button onClick={() => onViewDetails(g)} className="text-[10px] uppercase tracking-wider font-bold text-white bg-[#2563EB] hover:bg-[#1E40AF] px-2 py-1 flex items-center gap-1" data-testid={`archive-details-${g.key}`}>
-                  <Eye className="w-3 h-3" /> View details
-                </button>
-                <button onClick={() => onPrint(g)} className="text-[10px] uppercase tracking-wider font-bold text-slate-700 border border-slate-300 hover:bg-slate-900 hover:text-white px-2 py-1 flex items-center gap-1">
-                  <Printer className="w-3 h-3" /> Card PDF
-                </button>
-                <button onClick={() => onPacking(g)} className="text-[10px] uppercase tracking-wider font-bold text-[#16A34A] border border-[#16A34A] hover:bg-[#16A34A] hover:text-white px-2 py-1 flex items-center gap-1">
-                  <Package className="w-3 h-3" /> Packing
-                </button>
-              </div>
-            </div>
-          </Card>
-        ))}
-      </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {/* Saved packing lists ledger */}
+      <Card className="overflow-hidden" data-testid="saved-packing-lists">
+        <div className="px-5 py-3 border-b-2 border-slate-200 flex items-baseline justify-between">
+          <h2 className="text-sm font-bold uppercase tracking-wider flex items-center gap-2">
+            <Package className="w-4 h-4 text-[#16A34A]" /> Saved Packing Lists
+          </h2>
+          <span className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">{savedPackingLists?.length || 0} total</span>
+        </div>
+        {!savedPackingLists?.length ? (
+          <div className="p-10 text-center text-slate-400 text-sm">No packing lists generated yet.</div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 border-b border-slate-200">
+              <tr className="text-left text-[10px] uppercase tracking-wider text-slate-600">
+                <th className="px-4 py-2 font-bold">When</th>
+                <th className="px-4 py-2 font-bold">PO #(s)</th>
+                <th className="px-4 py-2 font-bold">Client</th>
+                <th className="px-4 py-2 font-bold">Type</th>
+                <th className="px-4 py-2 font-bold">Notes</th>
+                <th className="px-4 py-2 font-bold text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {savedPackingLists.map(pl => (
+                <tr key={pl.id} className="border-b border-slate-100 hover:bg-slate-50" data-testid={`saved-pl-${pl.id}`}>
+                  <td className="px-4 py-2 font-mono text-[11px] text-slate-700 whitespace-nowrap">
+                    {pl.created_at ? new Date(pl.created_at).toLocaleString("en-IN", { hour12: false }) : "—"}
+                  </td>
+                  <td className="px-4 py-2 font-mono font-bold">
+                    {pl.merged ? (pl.po_numbers || []).join(" + ") : pl.po_number}
+                  </td>
+                  <td className="px-4 py-2 text-xs">{pl.client_name || "—"}</td>
+                  <td className="px-4 py-2">
+                    <span className={`text-[10px] uppercase tracking-wider font-bold px-2 py-0.5 ${pl.merged ? "bg-[#0F172A] text-white" : "bg-slate-100 text-slate-700"}`}>
+                      {pl.merged ? "MERGED" : "SINGLE"}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2 text-xs text-slate-600 max-w-md truncate">
+                    {pl.options?.notes || pl.options?.transporter || "—"}
+                  </td>
+                  <td className="px-4 py-2 text-right">
+                    <button onClick={() => onReDownloadPacking(pl)} className="text-[10px] uppercase tracking-wider font-bold text-[#16A34A] border border-[#16A34A] hover:bg-[#16A34A] hover:text-white px-2 py-1" data-testid={`redownload-pl-${pl.id}`}>
+                      <FileDown className="w-3 h-3 inline -mt-0.5 mr-1" /> Re-download
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
     </div>
   );
 }
@@ -1146,6 +1253,166 @@ function DLPair({ label, value }) {
     <div className="border-b border-dashed border-slate-200 pb-2">
       <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">{label}</div>
       <div className="font-mono font-bold">{value || "—"}</div>
+    </div>
+  );
+}
+
+
+/* -------------------- PACKING LIST DIALOG -------------------- */
+function PackingListDialog({ payload, onClose, onSubmit }) {
+  const isMerged = payload.kind === "merged";
+  const summary = isMerged
+    ? `${payload.jobs.length} job(s) across ${new Set(payload.jobs.map(j => j.po_id)).size} PO(s)`
+    : `${payload.group?.style_code} · ${payload.group?.color} · ${payload.group?.totalQty} pairs`;
+
+  const [form, setForm] = useState({
+    carton_dim: "60x50x30 CMS",
+    pcs_per_box: 20,
+    net_wt_per_carton: 10.8,
+    gross_wt_per_carton: 12.0,
+    dispatch_date: new Date().toISOString().slice(0, 10),
+    transporter: "",
+    vehicle_no: "",
+    driver_name: "",
+    driver_phone: "",
+    site_code: "",
+    destination: "",
+    port: "",
+    notes: "",
+    sectioned: false,
+  });
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async () => {
+    setSubmitting(true);
+    try {
+      const payload2 = { ...form };
+      if (!isMerged) delete payload2.sectioned;
+      await onSubmit(payload2);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 grid place-items-center p-4" data-testid="packing-dialog">
+      <div className="bg-white w-full max-w-3xl max-h-[92vh] overflow-y-auto border-2 border-slate-200 shadow-2xl">
+        <div className="bg-[#16A34A] text-white px-6 py-4 flex items-baseline justify-between">
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.2em] font-bold opacity-90">
+              {isMerged ? "Merged Packing List" : "Packing List"}
+            </div>
+            <div className="text-lg font-bold">{summary}</div>
+          </div>
+          <button onClick={onClose} className="p-1 hover:bg-white/20" data-testid="packing-close"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="p-6 space-y-5">
+          <div className="bg-amber-50 border border-amber-200 px-4 py-2 text-xs text-slate-700">
+            <b className="text-[#C27842]">Tip:</b> The system auto-fills line items from the production data (PO / Style / Colour / Sizes / Qty). Use this form to add <b>shipping & carton info</b> that isn't on the production card. The packing list is saved in the Archive and can be re-downloaded any time.
+          </div>
+
+          {/* Carton */}
+          <Section title="Carton specification">
+            <Field label="Pcs / Carton">
+              <input type="number" min="1" value={form.pcs_per_box} onChange={e => set("pcs_per_box", Number(e.target.value))}
+                data-testid="pl-pcs-per-box" className="w-full border-2 border-slate-300 px-3 py-2 font-mono text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+            <Field label="Carton dimension">
+              <input value={form.carton_dim} onChange={e => set("carton_dim", e.target.value)}
+                data-testid="pl-carton-dim" className="w-full border-2 border-slate-300 px-3 py-2 font-mono text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+            <Field label="Net wt / Carton (kg)">
+              <input type="number" step="0.1" value={form.net_wt_per_carton} onChange={e => set("net_wt_per_carton", Number(e.target.value))}
+                data-testid="pl-net-wt" className="w-full border-2 border-slate-300 px-3 py-2 font-mono text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+            <Field label="Gross wt / Carton (kg)">
+              <input type="number" step="0.1" value={form.gross_wt_per_carton} onChange={e => set("gross_wt_per_carton", Number(e.target.value))}
+                data-testid="pl-gross-wt" className="w-full border-2 border-slate-300 px-3 py-2 font-mono text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+          </Section>
+
+          <Section title="Dispatch & Vehicle">
+            <Field label="Dispatch date">
+              <input type="date" value={form.dispatch_date} onChange={e => set("dispatch_date", e.target.value)}
+                data-testid="pl-dispatch-date" className="w-full border-2 border-slate-300 px-3 py-2 text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+            <Field label="Transporter">
+              <input value={form.transporter} onChange={e => set("transporter", e.target.value)}
+                data-testid="pl-transporter" className="w-full border-2 border-slate-300 px-3 py-2 text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+            <Field label="Vehicle no">
+              <input value={form.vehicle_no} onChange={e => set("vehicle_no", e.target.value)}
+                data-testid="pl-vehicle" className="w-full border-2 border-slate-300 px-3 py-2 font-mono text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+            <Field label="Driver name">
+              <input value={form.driver_name} onChange={e => set("driver_name", e.target.value)}
+                data-testid="pl-driver-name" className="w-full border-2 border-slate-300 px-3 py-2 text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+            <Field label="Driver phone">
+              <input value={form.driver_phone} onChange={e => set("driver_phone", e.target.value)}
+                data-testid="pl-driver-phone" className="w-full border-2 border-slate-300 px-3 py-2 font-mono text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+          </Section>
+
+          <Section title="Destination & Site">
+            <Field label="Site code (eg. SAUY)">
+              <input value={form.site_code} onChange={e => set("site_code", e.target.value)}
+                data-testid="pl-site-code" className="w-full border-2 border-slate-300 px-3 py-2 font-mono text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+            <Field label="Destination / Hub">
+              <input value={form.destination} onChange={e => set("destination", e.target.value)}
+                data-testid="pl-destination" className="w-full border-2 border-slate-300 px-3 py-2 text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+            <Field label="Port (for export)">
+              <input value={form.port} onChange={e => set("port", e.target.value)}
+                data-testid="pl-port" className="w-full border-2 border-slate-300 px-3 py-2 text-sm focus:border-[#16A34A] outline-none" />
+            </Field>
+          </Section>
+
+          <div>
+            <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500 mb-1">Notes / Special instructions</div>
+            <textarea rows={3} value={form.notes} onChange={e => set("notes", e.target.value)}
+              data-testid="pl-notes" placeholder="Fragile, stack max 3 high, handle with care…"
+              className="w-full border-2 border-slate-300 px-3 py-2 text-sm focus:border-[#16A34A] outline-none" />
+          </div>
+
+          {isMerged && (
+            <label className="flex items-center gap-2 text-sm cursor-pointer" data-testid="pl-sectioned-label">
+              <input type="checkbox" checked={form.sectioned} onChange={e => set("sectioned", e.target.checked)} data-testid="pl-sectioned" className="w-4 h-4" />
+              <span><b>Sectioned layout</b> — group lines per PO with header rows (otherwise all lines combined into one block).</span>
+            </label>
+          )}
+
+          <div className="flex gap-2 pt-4 border-t border-slate-200">
+            <BtnPrimary onClick={submit} disabled={submitting} data-testid="pl-submit"
+              className="bg-[#16A34A] border-[#16A34A] hover:bg-[#0F7A36]">
+              <Printer className="w-3.5 h-3.5 inline -mt-0.5 mr-1" />
+              {submitting ? "Generating…" : "Generate, Save & Download"}
+            </BtnPrimary>
+            <BtnSecondary onClick={onClose}>Cancel</BtnSecondary>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Section({ title, children }) {
+  return (
+    <div>
+      <div className="text-[11px] uppercase tracking-[0.2em] text-[#C27842] font-bold mb-2 border-b border-slate-200 pb-1">{title}</div>
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">{children}</div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider font-bold text-slate-500 mb-1">{label}</div>
+      {children}
     </div>
   );
 }

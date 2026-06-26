@@ -244,11 +244,41 @@ class PackingListGenerate(BaseModel):
     pcs_per_box: Optional[int] = 20
     net_wt_per_carton: Optional[float] = 10.8
     gross_wt_per_carton: Optional[float] = 12.0
+    # Manual / extra metadata captured at generation time
+    dispatch_date: Optional[str] = ""
+    transporter: Optional[str] = ""
+    vehicle_no: Optional[str] = ""
+    driver_name: Optional[str] = ""
+    driver_phone: Optional[str] = ""
+    site_code: Optional[str] = ""
+    destination: Optional[str] = ""
+    port: Optional[str] = ""
+    notes: Optional[str] = ""
+
+
+class MergedPackingListGenerate(BaseModel):
+    job_ids: List[str]  # jobs across one or more POs (must share the same client for merging)
+    template_id: Optional[str] = None
+    carton_dim: Optional[str] = "60x50x30 CMS"
+    pcs_per_box: Optional[int] = 20
+    net_wt_per_carton: Optional[float] = 10.8
+    gross_wt_per_carton: Optional[float] = 12.0
+    sectioned: Optional[bool] = False  # if True, emit one section per PO with headers
+    dispatch_date: Optional[str] = ""
+    transporter: Optional[str] = ""
+    vehicle_no: Optional[str] = ""
+    driver_name: Optional[str] = ""
+    driver_phone: Optional[str] = ""
+    site_code: Optional[str] = ""
+    destination: Optional[str] = ""
+    port: Optional[str] = ""
+    notes: Optional[str] = ""
 
 
 class PackingTemplateIn(BaseModel):
     client_name: str
     name: str   # human-friendly label
+    aliases: Optional[List[str]] = None  # client-name keywords this template auto-matches
     file_b64: str  # base64-encoded xlsx file contents
 
 class DefectIn(BaseModel):
@@ -825,50 +855,190 @@ async def _build_packing_payload(po: dict, job_ids: list[str] | None) -> dict:
     return out
 
 
+def _packing_options_from_payload(p) -> dict:
+    """Pull all manual / shipping fields from the request payload."""
+    return {
+        "carton_dim": p.carton_dim,
+        "pcs_per_box": p.pcs_per_box,
+        "net_wt_per_carton": p.net_wt_per_carton,
+        "gross_wt_per_carton": p.gross_wt_per_carton,
+        "dispatch_date": p.dispatch_date or "",
+        "transporter": p.transporter or "",
+        "vehicle_no": p.vehicle_no or "",
+        "driver_name": p.driver_name or "",
+        "driver_phone": p.driver_phone or "",
+        "site_code": p.site_code or "",
+        "destination": p.destination or "",
+        "port": p.port or "",
+        "notes": p.notes or "",
+    }
+
+
+async def _auto_pick_template(client_name: str) -> Optional[str]:
+    """Return template_id whose alias matches client_name; case-insensitive
+    substring match. Returns None if no template configured."""
+    if not client_name:
+        return None
+    docs = await db.packing_templates.find({}).to_list(200)
+    cn = client_name.upper()
+    best = None
+    for d in docs:
+        aliases = [a.upper().strip() for a in (d.get("aliases") or []) if a and a.strip()]
+        if not aliases:
+            # Also try exact client_name match on stored field
+            if d.get("client_name", "").strip().upper() == cn:
+                return str(d["_id"])
+            continue
+        if any(a in cn or cn in a for a in aliases):
+            best = str(d["_id"])
+            break
+    return best
+
+
+async def _generate_packing_bytes(payload_po: dict, options: dict, template_id: Optional[str]) -> bytes:
+    """Resolve template (explicit or auto) and produce the xlsx bytes."""
+    tpl_id = template_id
+    if not tpl_id:
+        tpl_id = await _auto_pick_template(payload_po.get("client_name", ""))
+    if tpl_id:
+        tdoc = await db.packing_templates.find_one({"_id": oid(tpl_id)})
+        if not tdoc:
+            raise HTTPException(404, "Packing template not found")
+        import base64 as b64
+        tpl_bytes = b64.b64decode(tdoc["file_b64"])
+        return build_from_template(tpl_bytes, payload_po, options)
+    return build_default_packing_list(payload_po, options)
+
+
 @api.post("/packing-lists/job")
 async def generate_packing_list(payload: PackingListGenerate, request: Request):
-    """Generate a packing-list xlsx. If `template_id` is set, use the per-client
-    template; otherwise emit the default SSK format."""
+    """Generate a packing-list xlsx for a single PO (optionally filtered by jobs).
+    Stores the bytes so the user can re-download from Archive later."""
     u = await get_current_user(request); require_roles("admin", "manager", "sales")(u)
     po_doc = await db.pos.find_one({"_id": oid(payload.po_id)})
     if not po_doc:
         raise HTTPException(404, "PO not found")
     po = stringify(po_doc)
     payload_po = await _build_packing_payload(po, payload.job_ids)
-    options = {
-        "carton_dim": payload.carton_dim,
-        "pcs_per_box": payload.pcs_per_box,
-        "net_wt_per_carton": payload.net_wt_per_carton,
-        "gross_wt_per_carton": payload.gross_wt_per_carton,
-    }
+    options = _packing_options_from_payload(payload)
+    xlsx_bytes = await _generate_packing_bytes(payload_po, options, payload.template_id)
 
-    if payload.template_id:
-        tdoc = await db.packing_templates.find_one({"_id": oid(payload.template_id)})
-        if not tdoc:
-            raise HTTPException(404, "Template not found")
-        import base64 as b64
-        try:
-            tpl_bytes = b64.b64decode(tdoc["file_b64"])
-        except Exception as e:
-            raise HTTPException(400, f"Bad template file: {e}")
-        xlsx_bytes = build_from_template(tpl_bytes, payload_po, options)
-    else:
-        xlsx_bytes = build_default_packing_list(payload_po, options)
-
-    # Persist the record + flag affected jobs
+    import base64 as b64
     rec = {
         "po_id": payload.po_id, "po_number": po.get("po_number"),
+        "po_numbers": [po.get("po_number")],
         "client_name": po.get("client_name"),
         "job_ids": payload.job_ids or [],
         "template_id": payload.template_id,
         "options": options, "by": u["email"], "created_at": now_iso(),
+        "file_b64": b64.b64encode(xlsx_bytes).decode("ascii"),
+        "merged": False,
     }
-    await db.packing_lists.insert_one(rec)
+    res = await db.packing_lists.insert_one(rec)
     await _flag_jobs(payload.job_ids or [], "packing_generated_at")
 
     fname = f"PackingList-{po.get('po_number','po')}-{datetime.now().strftime('%Y%m%d-%H%M')}.xlsx"
     return StreamingResponse(
         BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "X-Packing-List-Id": str(res.inserted_id),
+        },
+    )
+
+
+@api.post("/packing-lists/merged")
+async def generate_merged_packing_list(payload: MergedPackingListGenerate, request: Request):
+    """Generate ONE packing list covering jobs from multiple POs of the same
+    client (mirrors merged-invoice flow)."""
+    u = await get_current_user(request); require_roles("admin", "manager", "sales")(u)
+    if not payload.job_ids:
+        raise HTTPException(400, "Provide job_ids to merge")
+    jobs = await db.production_jobs.find({"_id": {"$in": [oid(j) for j in payload.job_ids]}}).to_list(2000)
+    if not jobs:
+        raise HTTPException(404, "No jobs found")
+    po_ids = list({j.get("po_id") for j in jobs if j.get("po_id")})
+    po_docs = await db.pos.find({"_id": {"$in": [oid(p) for p in po_ids]}}).to_list(200)
+    if not po_docs:
+        raise HTTPException(404, "No POs found for these jobs")
+    po_docs = [stringify(p) for p in po_docs]
+
+    # All POs must share the same client for a coherent packing list.
+    clients = {p.get("client_name", "").strip() for p in po_docs}
+    if len(clients) > 1:
+        raise HTTPException(400, f"Cannot merge POs of different clients: {clients}")
+    parent = po_docs[0]
+    po_numbers = [p.get("po_number", "") for p in po_docs]
+
+    # Build aggregated line items
+    job_ids_str = [str(j["_id"]) for j in jobs]
+    all_items: list[dict] = []
+    for p in po_docs:
+        _, items = await _generate_invoice_payload(p, job_ids_str)
+        if payload.sectioned:
+            # Annotate items so the section header can be inserted in the template
+            for it in items:
+                it["_po_number"] = p.get("po_number", "")
+        all_items.extend(items)
+
+    payload_po = dict(parent)
+    payload_po["line_items"] = all_items
+    payload_po["total_quantity"] = sum((li.get("quantity") or 0) for li in all_items)
+    payload_po["po_number"] = " + ".join(po_numbers)
+
+    options = _packing_options_from_payload(payload)
+    xlsx_bytes = await _generate_packing_bytes(payload_po, options, payload.template_id)
+
+    import base64 as b64
+    rec = {
+        "merged": True, "po_numbers": po_numbers, "client_name": parent.get("client_name"),
+        "job_ids": job_ids_str, "template_id": payload.template_id,
+        "options": options, "by": u["email"], "created_at": now_iso(),
+        "file_b64": b64.b64encode(xlsx_bytes).decode("ascii"),
+    }
+    res = await db.packing_lists.insert_one(rec)
+    await _flag_jobs(job_ids_str, "packing_generated_at")
+
+    fname = f"PackingList-MERGED-{datetime.now().strftime('%Y%m%d-%H%M')}.xlsx"
+    return StreamingResponse(
+        BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "X-Packing-List-Id": str(res.inserted_id),
+        },
+    )
+
+
+@api.get("/packing-lists")
+async def list_packing_lists(request: Request, po_id: Optional[str] = None,
+                             client: Optional[str] = None, limit: int = 200):
+    """List saved packing lists. Optional filters: by po_id or client_name."""
+    await get_current_user(request)
+    q: dict = {}
+    if po_id:
+        q["po_id"] = po_id
+    if client:
+        q["client_name"] = {"$regex": re.escape(client), "$options": "i"}
+    docs = await db.packing_lists.find(q, {"file_b64": 0}).sort("created_at", -1).to_list(limit)
+    return [stringify(d) for d in docs]
+
+
+@api.get("/packing-lists/{plid}/file")
+async def download_packing_list(plid: str, request: Request):
+    await get_current_user(request)
+    doc = await db.packing_lists.find_one({"_id": oid(plid)})
+    if not doc:
+        raise HTTPException(404, "Packing list not found")
+    import base64 as b64
+    raw = b64.b64decode(doc.get("file_b64", "") or b"")
+    if not raw:
+        raise HTTPException(404, "File not stored for this entry")
+    label = "MERGED" if doc.get("merged") else doc.get("po_number", "po")
+    fname = f"PackingList-{label}-{doc.get('created_at','')[:10]}.xlsx"
+    return StreamingResponse(
+        BytesIO(raw),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
@@ -898,6 +1068,7 @@ async def create_packing_template(payload: PackingTemplateIn, request: Request):
     doc = {
         "client_name": payload.client_name.strip(),
         "name": payload.name.strip(),
+        "aliases": [a.strip() for a in (payload.aliases or []) if a and a.strip()],
         "file_b64": payload.file_b64,
         "by": u["email"],
         "created_at": now_iso(),
