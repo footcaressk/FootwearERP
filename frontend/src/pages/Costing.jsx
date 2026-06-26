@@ -42,6 +42,15 @@ export default function Costing() {
 
           {selected && (
             <div className="mt-6 space-y-5">
+              {selected.image_url && (
+                <div className="border-2 border-slate-200 overflow-hidden bg-slate-100" data-testid="costing-style-image">
+                  <img src={selected.image_url} alt={selected.name} className="w-full h-56 object-cover" />
+                  <div className="bg-white px-4 py-2 border-t-2 border-slate-200 flex items-baseline justify-between">
+                    <span className="font-mono text-xs font-bold text-slate-500">{selected.code}</span>
+                    <span className="font-bold text-sm">{selected.name}</span>
+                  </div>
+                </div>
+              )}
               <Section title="Bill of Materials">
                 <table className="w-full text-xs border-2 border-slate-200">
                   <thead className="bg-slate-50">

@@ -4,7 +4,11 @@ import { PageHeader, Card, BtnPrimary, BtnSecondary, Input, Select, Badge } from
 import { Drawer } from "./Materials";
 import { Plus, Trash2, Pencil, Save, Calculator as CalcIcon, Upload } from "lucide-react";
 
-const SECTIONS = ["upper", "sole", "lining", "accessory", "consumable", "packing", "other"];
+const SECTIONS = [
+  "Upper Top", "Mid Layer / Reinforcement", "Lining",
+  "Bottom Layer", "Insole Board + Cushion", "Insole Cover (PU/Leather)",
+  "Sole", "Accessory", "Consumable", "Packing", "Other",
+];
 
 const emptyStyle = {
   code: "", name: "", category: "Footwear", image_url: "", description: "", base_size: "7",
@@ -124,7 +128,20 @@ export default function Styles() {
         ) : (
           <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4" data-testid="styles-grid">
             {styles.map((s) => (
-              <Card key={s.id} className="p-5 hover:border-[#C27842] transition-colors">
+              <Card key={s.id} className="overflow-hidden hover:border-[#C27842] transition-colors" data-testid={`style-card-${s.code}`}>
+                {s.image_url ? (
+                  <div className="h-44 bg-slate-100 border-b-2 border-slate-200 overflow-hidden">
+                    <img src={s.image_url} alt={s.name} className="w-full h-full object-cover" />
+                  </div>
+                ) : (
+                  <div className="h-44 bg-gradient-to-br from-slate-50 to-slate-100 border-b-2 border-slate-200 grid place-items-center">
+                    <div className="text-center">
+                      <div className="text-3xl mb-1">👟</div>
+                      <div className="text-[10px] uppercase tracking-[0.2em] text-slate-400 font-bold">No Image</div>
+                    </div>
+                  </div>
+                )}
+                <div className="p-5">
                 <div className="flex items-baseline justify-between mb-2">
                   <div className="font-mono text-xs font-bold text-slate-500">{s.code}</div>
                   <Badge color="orange">{s.category}</Badge>
@@ -142,6 +159,7 @@ export default function Styles() {
                   <button onClick={() => remove(s.id)} className="px-3 py-2 border-2 border-slate-300 hover:border-red-500 hover:text-red-600 text-xs">
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
+                </div>
                 </div>
               </Card>
             ))}
@@ -225,9 +243,14 @@ export default function Styles() {
                       <tr key={i} className="border-t border-slate-200">
                         <td className="px-2 py-1.5"><div className="font-mono">{b.material_code}</div><div className="text-[10px] text-slate-500">{b.material_name}</div></td>
                         <td className="px-2 py-1.5">
-                          <select className="font-mono border border-slate-300 px-1 py-0.5 text-xs" value={b.section} onChange={(e) => updateBom(i, "section", e.target.value)}>
-                            {SECTIONS.map(s => <option key={s} value={s}>{s}</option>)}
-                          </select>
+                          <input
+                            list="bom-sections-list"
+                            className="font-mono border border-slate-300 px-1 py-0.5 text-xs w-36"
+                            value={b.section}
+                            onChange={(e) => updateBom(i, "section", e.target.value)}
+                            data-testid={`bom-section-${i}`}
+                            placeholder="type or pick…"
+                          />
                         </td>
                         <td className="px-2 py-1.5 text-right font-mono">₹{b.rate}<span className="text-[10px] text-slate-400">/{b.unit}</span></td>
                         <td className="px-2 py-1.5"><input type="number" step="0.01" value={b.quantity} onChange={(e) => updateBom(i, "quantity", e.target.value)} className="w-16 text-right font-mono border border-slate-300 px-1 py-0.5" /></td>
@@ -294,6 +317,9 @@ export default function Styles() {
           </div>
         </Drawer>
       )}
+      <datalist id="bom-sections-list">
+        {SECTIONS.map(s => <option key={s} value={s} />)}
+      </datalist>
     </div>
   );
 }

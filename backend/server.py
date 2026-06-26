@@ -21,7 +21,7 @@ from auth import (
     get_current_user_factory, require_roles, seed_admin,
 )
 from po_extractor import extract_po_from_pdf, extract_po_from_xlsx
-from pdf_docs import generate_tax_invoice_pdf, generate_dispatch_challan_pdf
+from pdf_docs import generate_dispatch_challan_pdf, build_invoice
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 
@@ -93,7 +93,8 @@ class BomItem(BaseModel):
     quantity: float
     yield_per_unit: float = 1  # pairs produced per 1 unit of material (e.g., 10 uppers per meter)
     waste_pct: float = 0
-    section: Literal["upper", "sole", "lining", "accessory", "consumable", "packing", "other"] = "other"
+    section: str = "Other"
+    component: Optional[str] = None  # "upper" | "bottom" | "sole" (auto-classified or manual)
 
 class LaborItem(BaseModel):
     name: str
@@ -157,6 +158,19 @@ class ProductionStageUpdate(BaseModel):
     rejected_qty: Optional[int] = None
     qc_pass: Optional[bool] = None
     notes: Optional[str] = ""
+
+class ComponentUpdate(BaseModel):
+    upper_done: Optional[bool] = None
+    bottom_done: Optional[bool] = None
+    sole_done: Optional[bool] = None
+    notes: Optional[str] = ""
+
+class InvoiceGenerate(BaseModel):
+    po_id: str
+    job_ids: Optional[List[str]] = None  # if None, full PO; otherwise dispatched-only items
+    transport_mode: Optional[str] = ""
+    vehicle_no: Optional[str] = ""
+    supply_date: Optional[str] = ""
 
 class DefectIn(BaseModel):
     po_number: str
@@ -466,6 +480,71 @@ async def extract_po(file: UploadFile = File(...), request: Request = None):
         raise HTTPException(500, f"Extraction failed: {e}")
 
 
+async def next_invoice_no() -> str:
+    """Generate SSK<FY>-XXX format like SSK26-27-004. FY based on Apr-Mar split."""
+    today = datetime.now(timezone.utc)
+    # Indian FY starts April. If month < 4, FY started prev year.
+    yr = today.year
+    if today.month < 4:
+        fy_start = yr - 1
+    else:
+        fy_start = yr
+    fy_end = fy_start + 1
+    fy_label = f"{str(fy_start)[-2:]}-{str(fy_end)[-2:]}"
+    # Atomic counter
+    counter = await db.counters.find_one_and_update(
+        {"_id": f"invoice_{fy_label}"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=True,
+    )
+    seq = counter.get("seq", 1) if counter else 1
+    return f"SSK{fy_label}-{seq:03d}"
+
+
+async def _generate_invoice_payload(po: dict, job_ids: list[str] | None) -> tuple[dict, list[dict]]:
+    """Returns the (po-augmented, line_items) for invoice generation.
+
+    If job_ids given, filter dispatched jobs and rebuild line items from them — supports merged
+    invoice across multiple dispatched cards.
+    """
+    if not job_ids:
+        return po, po.get("line_items", [])
+
+    # Pull dispatched production_jobs by ids, aggregate per (style_code, color, size)
+    obj_ids = []
+    for jid in job_ids:
+        try:
+            obj_ids.append(oid(jid))
+        except HTTPException:
+            continue
+    jobs = await db.production_jobs.find({"_id": {"$in": obj_ids}}).to_list(2000)
+    # Build map of line items from PO indexed by (style, color, size)
+    po_items = po.get("line_items", [])
+    idx = {}
+    for li in po_items:
+        idx[(li.get("style_code"), li.get("color"), str(li.get("size", "")))] = li
+
+    line_items = []
+    for j in jobs:
+        key = (j.get("style_code"), j.get("color"), str(j.get("size", "")))
+        li_src = idx.get(key, {})
+        qty = j.get("quantity", 0)
+        unit_price = li_src.get("unit_price", 0)
+        line_items.append({
+            "style_code": j.get("style_code", ""),
+            "description": j.get("description") or li_src.get("description", ""),
+            "color": j.get("color", ""),
+            "size": str(j.get("size", "")),
+            "hsn_code": li_src.get("hsn_code", "") or "64029990",
+            "quantity": qty,
+            "unit_price": unit_price,
+            "amount": round(qty * unit_price, 2),
+            "mrp": li_src.get("mrp", ""),
+        })
+    return po, line_items
+
+
 @api.get("/pos/{pid}/invoice.pdf")
 async def po_invoice(pid: str, request: Request):
     await get_current_user(request)
@@ -473,10 +552,114 @@ async def po_invoice(pid: str, request: Request):
     if not doc:
         raise HTTPException(404, "Not found")
     po = stringify(doc)
-    pdf_bytes = generate_tax_invoice_pdf(po)
+    # auto-issue invoice number on first download (and persist)
+    invoice_no = po.get("invoice_no")
+    invoice_date = po.get("invoice_date")
+    if not invoice_no:
+        invoice_no = await next_invoice_no()
+        invoice_date = datetime.now().strftime("%d/%m/%Y")
+        await db.pos.update_one({"_id": oid(pid)}, {"$set": {"invoice_no": invoice_no, "invoice_date": invoice_date}})
+        po["invoice_no"] = invoice_no
+        po["invoice_date"] = invoice_date
+    pdf_bytes = build_invoice(po, invoice_no, invoice_date)
     return StreamingResponse(
         BytesIO(pdf_bytes), media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="invoice-{po.get("po_number","po")}.pdf"'},
+        headers={"Content-Disposition": f'inline; filename="{invoice_no}.pdf"'},
+    )
+
+
+@api.post("/invoices/job")
+async def invoice_for_jobs(payload: InvoiceGenerate, request: Request):
+    """Generate an invoice for a subset of production jobs (dispatched). Supports merging."""
+    u = await get_current_user(request); require_roles("admin", "manager", "sales")(u)
+    po_doc = await db.pos.find_one({"_id": oid(payload.po_id)})
+    if not po_doc:
+        raise HTTPException(404, "PO not found")
+    po = stringify(po_doc)
+    po, line_items = await _generate_invoice_payload(po, payload.job_ids)
+    if not line_items:
+        raise HTTPException(400, "No line items for invoice")
+
+    invoice_no = await next_invoice_no()
+    invoice_date = datetime.now().strftime("%d/%m/%Y")
+    pdf_bytes = build_invoice(
+        po, invoice_no, invoice_date,
+        transport_mode=payload.transport_mode or "",
+        vehicle_no=payload.vehicle_no or "",
+        supply_date=payload.supply_date or "",
+        line_items=line_items,
+    )
+    # Store invoice record
+    await db.invoices.insert_one({
+        "invoice_no": invoice_no, "invoice_date": invoice_date,
+        "po_id": payload.po_id, "po_number": po.get("po_number"),
+        "client_name": po.get("client_name"),
+        "job_ids": payload.job_ids or [],
+        "line_items_snapshot": line_items,
+        "transport_mode": payload.transport_mode, "vehicle_no": payload.vehicle_no,
+        "supply_date": payload.supply_date,
+        "by": u["email"], "created_at": now_iso(),
+    })
+    return StreamingResponse(
+        BytesIO(pdf_bytes), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{invoice_no}.pdf"'},
+    )
+
+
+@api.post("/invoices/merged")
+async def merged_invoice(payload: dict, request: Request):
+    """Generate a single merged invoice across multiple POs/jobs.
+    payload: { entries: [{po_id, job_ids:[...]}] , transport_mode, vehicle_no, supply_date }
+    All entries must share the same client (uses first PO's client).
+    """
+    u = await get_current_user(request); require_roles("admin", "manager", "sales")(u)
+    entries = payload.get("entries", [])
+    if not entries:
+        raise HTTPException(400, "No entries")
+
+    # use first PO as the parent (for client/billing/etc.)
+    first_po = await db.pos.find_one({"_id": oid(entries[0]["po_id"])})
+    if not first_po:
+        raise HTTPException(404, "First PO not found")
+    parent = stringify(first_po)
+
+    all_items = []
+    po_numbers = []
+    job_ids_all = []
+    for e in entries:
+        po_doc = await db.pos.find_one({"_id": oid(e["po_id"])})
+        if not po_doc:
+            continue
+        po_x = stringify(po_doc)
+        po_numbers.append(po_x.get("po_number", ""))
+        _, lis = await _generate_invoice_payload(po_x, e.get("job_ids"))
+        all_items.extend(lis)
+        job_ids_all.extend(e.get("job_ids") or [])
+
+    if not all_items:
+        raise HTTPException(400, "No line items found across entries")
+
+    invoice_no = await next_invoice_no()
+    invoice_date = datetime.now().strftime("%d/%m/%Y")
+    # show comma-joined PO numbers in the parent for the meta block
+    parent["po_number"] = ", ".join([p for p in po_numbers if p])
+    pdf_bytes = build_invoice(
+        parent, invoice_no, invoice_date,
+        transport_mode=payload.get("transport_mode", ""),
+        vehicle_no=payload.get("vehicle_no", ""),
+        supply_date=payload.get("supply_date", ""),
+        line_items=all_items,
+    )
+    await db.invoices.insert_one({
+        "invoice_no": invoice_no, "invoice_date": invoice_date,
+        "merged": True, "po_numbers": po_numbers, "job_ids": job_ids_all,
+        "client_name": parent.get("client_name"),
+        "line_items_snapshot": all_items,
+        "by": u["email"], "created_at": now_iso(),
+    })
+    return StreamingResponse(
+        BytesIO(pdf_bytes), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{invoice_no}.pdf"'},
     )
 
 
@@ -631,6 +814,27 @@ async def update_job(jid: str, payload: ProductionStageUpdate, request: Request)
     await db.production_jobs.update_one(
         {"_id": oid(jid)},
         {"$set": update, "$push": {"history": history_entry}},
+    )
+    return stringify(await db.production_jobs.find_one({"_id": oid(jid)}))
+
+
+@api.patch("/production/jobs/{jid}/components")
+async def update_job_components(jid: str, payload: ComponentUpdate, request: Request):
+    """Toggle Upper / Bottom / Sole completion per production job."""
+    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+    job = await db.production_jobs.find_one({"_id": oid(jid)})
+    if not job:
+        raise HTTPException(404, "Not found")
+    comps = job.get("components") or {"upper_done": False, "bottom_done": False, "sole_done": False}
+    for k in ("upper_done", "bottom_done", "sole_done"):
+        v = getattr(payload, k)
+        if v is not None:
+            comps[k] = bool(v)
+    await db.production_jobs.update_one(
+        {"_id": oid(jid)},
+        {"$set": {"components": comps, "updated_at": now_iso()},
+         "$push": {"history": {"event": "component_update", "components": comps,
+                               "at": now_iso(), "by": u["email"], "notes": payload.notes or ""}}}
     )
     return stringify(await db.production_jobs.find_one({"_id": oid(jid)}))
 
