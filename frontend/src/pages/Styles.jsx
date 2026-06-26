@@ -1,0 +1,260 @@
+import { useEffect, useMemo, useState } from "react";
+import { http, inr, num } from "../lib/api";
+import { PageHeader, Card, BtnPrimary, BtnSecondary, Input, Select, Badge } from "../components/ui-kit";
+import { Drawer } from "./Materials";
+import { Plus, Trash2, Pencil, Save, Calculator as CalcIcon } from "lucide-react";
+
+const SECTIONS = ["upper", "sole", "lining", "accessory", "consumable", "packing", "other"];
+
+const emptyStyle = {
+  code: "", name: "", category: "Footwear", image_url: "", description: "", base_size: "7",
+  bom: [], labor: [
+    { name: "Cutting", rate: 6 }, { name: "Fitting", rate: 12 }, { name: "Pasting", rate: 8 },
+    { name: "Finishing", rate: 6 }, { name: "Packing", rate: 3 },
+  ],
+  overhead_pct: 8, packing_cost: 12, margin_pct: 25, gst_pct: 5,
+};
+
+export default function Styles() {
+  const [styles, setStyles] = useState([]);
+  const [materials, setMaterials] = useState([]);
+  const [open, setOpen] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const [form, setForm] = useState(emptyStyle);
+
+  const load = async () => {
+    const [s, m] = await Promise.all([http.get("/styles"), http.get("/materials")]);
+    setStyles(s.data); setMaterials(m.data);
+  };
+  useEffect(() => { load(); }, []);
+
+  const startNew = () => { setEditId(null); setForm(emptyStyle); setOpen(true); };
+  const startEdit = (s) => {
+    setEditId(s.id);
+    setForm({
+      code: s.code, name: s.name, category: s.category, image_url: s.image_url || "",
+      description: s.description || "", base_size: s.base_size || "7",
+      bom: s.bom || [], labor: s.labor || [],
+      overhead_pct: s.overhead_pct, packing_cost: s.packing_cost,
+      margin_pct: s.margin_pct, gst_pct: s.gst_pct,
+    });
+    setOpen(true);
+  };
+  const save = async () => {
+    const body = {
+      ...form,
+      overhead_pct: Number(form.overhead_pct), packing_cost: Number(form.packing_cost),
+      margin_pct: Number(form.margin_pct), gst_pct: Number(form.gst_pct),
+      bom: form.bom.map(b => ({ ...b, quantity: Number(b.quantity), waste_pct: Number(b.waste_pct || 0), rate: Number(b.rate) })),
+      labor: form.labor.map(l => ({ ...l, rate: Number(l.rate) })),
+    };
+    if (editId) await http.patch(`/styles/${editId}`, body); else await http.post("/styles", body);
+    setOpen(false); load();
+  };
+  const remove = async (id) => {
+    if (!window.confirm("Delete this style?")) return;
+    await http.delete(`/styles/${id}`); load();
+  };
+
+  const addBomRow = (material) => {
+    setForm((f) => ({ ...f, bom: [...f.bom, {
+      material_id: material.id, material_code: material.code, material_name: material.name,
+      unit: material.unit, rate: material.rate, quantity: 1, waste_pct: 5, section: material.category,
+    }]}));
+  };
+
+  const updateBom = (i, key, val) => setForm((f) => ({ ...f, bom: f.bom.map((r, idx) => idx === i ? { ...r, [key]: val } : r) }));
+  const removeBom = (i) => setForm((f) => ({ ...f, bom: f.bom.filter((_, idx) => idx !== i) }));
+  const updateLabor = (i, key, val) => setForm((f) => ({ ...f, labor: f.labor.map((r, idx) => idx === i ? { ...r, [key]: val } : r) }));
+  const addLabor = () => setForm((f) => ({ ...f, labor: [...f.labor, { name: "Labor", rate: 0 }] }));
+  const removeLabor = (i) => setForm((f) => ({ ...f, labor: f.labor.filter((_, idx) => idx !== i) }));
+
+  // live costing
+  const costing = useMemo(() => {
+    const matCost = form.bom.reduce((s, b) => s + Number(b.rate) * Number(b.quantity) * (1 + Number(b.waste_pct || 0) / 100), 0);
+    const labCost = form.labor.reduce((s, l) => s + Number(l.rate), 0);
+    const base = matCost + labCost;
+    const oh = base * Number(form.overhead_pct) / 100;
+    const total = base + oh + Number(form.packing_cost);
+    const margin = total * Number(form.margin_pct) / 100;
+    const sell = total + margin;
+    const gst = sell * Number(form.gst_pct) / 100;
+    return { matCost, labCost, base, oh, total, margin, sell, gst, final: sell + gst };
+  }, [form]);
+
+  return (
+    <div>
+      <PageHeader
+        title="Style Master"
+        subtitle="Master / Styles"
+        testId="styles-header"
+        action={<BtnPrimary onClick={startNew} data-testid="add-style-btn"><Plus className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> New Style</BtnPrimary>}
+      />
+
+      <div className="p-8 space-y-4">
+        {styles.length === 0 ? (
+          <Card className="p-12 text-center text-slate-400">No styles defined yet. Create your first style to build a BOM and unlock automatic costing.</Card>
+        ) : (
+          <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4" data-testid="styles-grid">
+            {styles.map((s) => (
+              <Card key={s.id} className="p-5 hover:border-[#C27842] transition-colors">
+                <div className="flex items-baseline justify-between mb-2">
+                  <div className="font-mono text-xs font-bold text-slate-500">{s.code}</div>
+                  <Badge color="orange">{s.category}</Badge>
+                </div>
+                <h3 className="text-lg font-bold mb-1">{s.name}</h3>
+                <p className="text-xs text-slate-500 line-clamp-2 mb-3">{s.description || "—"}</p>
+                <div className="border-t border-dashed border-slate-200 pt-3 space-y-1 text-xs">
+                  <Row label="Materials" value={inr(s.costing.materials_cost)} />
+                  <Row label="Labor" value={inr(s.costing.labor_cost)} />
+                  <Row label="Total cost" value={inr(s.costing.total_cost)} bold />
+                  <Row label={`Selling (+${s.margin_pct}%)`} value={inr(s.costing.selling_price)} bold color="#C27842" />
+                </div>
+                <div className="flex gap-2 mt-4 pt-3 border-t border-slate-200">
+                  <BtnSecondary onClick={() => startEdit(s)} className="flex-1"><Pencil className="w-3 h-3 inline -mt-0.5 mr-1" /> Edit</BtnSecondary>
+                  <button onClick={() => remove(s.id)} className="px-3 py-2 border-2 border-slate-300 hover:border-red-500 hover:text-red-600 text-xs">
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </Card>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {open && (
+        <Drawer onClose={() => setOpen(false)} title={editId ? "Edit Style" : "New Style"} width="max-w-5xl">
+          <div className="grid grid-cols-3 gap-6">
+            <div className="col-span-2 space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <Input label="Style Code" value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} testId="form-style-code" />
+                <Input label="Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} testId="form-style-name" />
+              </div>
+              <div className="grid grid-cols-3 gap-3">
+                <Input label="Category" value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} />
+                <Input label="Base Size" value={form.base_size} onChange={(e) => setForm({ ...form, base_size: e.target.value })} />
+                <Input label="Image URL" value={form.image_url} onChange={(e) => setForm({ ...form, image_url: e.target.value })} />
+              </div>
+              <Input label="Description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
+
+              {/* BOM */}
+              <div>
+                <div className="flex items-baseline justify-between mt-4 mb-2">
+                  <h3 className="text-sm font-bold uppercase tracking-wider">Bill of Materials</h3>
+                  <select
+                    className="text-xs border-2 border-slate-300 px-2 py-1 bg-white"
+                    onChange={(e) => { const m = materials.find(x => x.id === e.target.value); if (m) addBomRow(m); e.target.value = ""; }}
+                    data-testid="bom-add-material"
+                    defaultValue=""
+                  >
+                    <option value="">+ Add material…</option>
+                    {materials.map(m => <option key={m.id} value={m.id}>{m.code} — {m.name}</option>)}
+                  </select>
+                </div>
+                <table className="w-full text-xs border-2 border-slate-200">
+                  <thead className="bg-slate-50">
+                    <tr className="text-left">
+                      <th className="px-2 py-2 font-bold">Material</th>
+                      <th className="px-2 py-2 font-bold">Section</th>
+                      <th className="px-2 py-2 font-bold text-right">Rate</th>
+                      <th className="px-2 py-2 font-bold text-right">Qty</th>
+                      <th className="px-2 py-2 font-bold text-right">Waste%</th>
+                      <th className="px-2 py-2 font-bold text-right">Cost</th>
+                      <th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {form.bom.length === 0 && (
+                      <tr><td colSpan="7" className="px-2 py-6 text-center text-slate-400">No items. Add from dropdown above.</td></tr>
+                    )}
+                    {form.bom.map((b, i) => (
+                      <tr key={i} className="border-t border-slate-200">
+                        <td className="px-2 py-1.5"><div className="font-mono">{b.material_code}</div><div className="text-[10px] text-slate-500">{b.material_name}</div></td>
+                        <td className="px-2 py-1.5">
+                          <select className="font-mono border border-slate-300 px-1 py-0.5 text-xs" value={b.section} onChange={(e) => updateBom(i, "section", e.target.value)}>
+                            {SECTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+                          </select>
+                        </td>
+                        <td className="px-2 py-1.5 text-right font-mono">₹{b.rate}</td>
+                        <td className="px-2 py-1.5"><input type="number" step="0.01" value={b.quantity} onChange={(e) => updateBom(i, "quantity", e.target.value)} className="w-16 text-right font-mono border border-slate-300 px-1 py-0.5" /></td>
+                        <td className="px-2 py-1.5"><input type="number" step="0.5" value={b.waste_pct} onChange={(e) => updateBom(i, "waste_pct", e.target.value)} className="w-14 text-right font-mono border border-slate-300 px-1 py-0.5" /></td>
+                        <td className="px-2 py-1.5 text-right font-mono font-bold">{inr(Number(b.rate) * Number(b.quantity) * (1 + Number(b.waste_pct || 0) / 100))}</td>
+                        <td className="px-2 py-1.5"><button onClick={() => removeBom(i)} className="text-slate-500 hover:text-red-600"><Trash2 className="w-3.5 h-3.5" /></button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Labor */}
+              <div>
+                <div className="flex items-baseline justify-between mt-4 mb-2">
+                  <h3 className="text-sm font-bold uppercase tracking-wider">Labor (per pair)</h3>
+                  <button onClick={addLabor} className="text-xs uppercase font-bold tracking-wider text-[#2563EB]" data-testid="labor-add">+ Add operation</button>
+                </div>
+                <table className="w-full text-xs border-2 border-slate-200">
+                  <tbody>
+                    {form.labor.map((l, i) => (
+                      <tr key={i} className="border-t border-slate-200 first:border-t-0">
+                        <td className="px-2 py-1.5"><input value={l.name} onChange={(e) => updateLabor(i, "name", e.target.value)} className="w-full border-0 bg-transparent" /></td>
+                        <td className="px-2 py-1.5 w-32"><input type="number" step="0.5" value={l.rate} onChange={(e) => updateLabor(i, "rate", e.target.value)} className="w-full text-right font-mono border border-slate-300 px-1 py-0.5" /></td>
+                        <td className="px-2 py-1.5 w-8"><button onClick={() => removeLabor(i)} className="text-slate-500 hover:text-red-600"><Trash2 className="w-3.5 h-3.5" /></button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="grid grid-cols-4 gap-3 pt-2">
+                <Input label="Overhead %" type="number" step="0.5" value={form.overhead_pct} onChange={(e) => setForm({ ...form, overhead_pct: e.target.value })} />
+                <Input label="Packing ₹" type="number" step="0.5" value={form.packing_cost} onChange={(e) => setForm({ ...form, packing_cost: e.target.value })} />
+                <Input label="Margin %" type="number" step="0.5" value={form.margin_pct} onChange={(e) => setForm({ ...form, margin_pct: e.target.value })} />
+                <Input label="GST %" type="number" step="0.5" value={form.gst_pct} onChange={(e) => setForm({ ...form, gst_pct: e.target.value })} />
+              </div>
+            </div>
+
+            {/* Live cost preview */}
+            <div className="col-span-1">
+              <div className="sticky top-0 bg-[#0F172A] text-white p-5 border-2 border-[#0F172A]">
+                <div className="text-[10px] uppercase tracking-[0.2em] text-[#C27842] font-bold mb-3 flex items-center gap-2"><CalcIcon className="w-3.5 h-3.5" /> Live Cost Sheet</div>
+                <CostRow label="Materials" value={inr(costing.matCost)} />
+                <CostRow label="Labor" value={inr(costing.labCost)} />
+                <CostRow label="Overhead" value={inr(costing.oh)} />
+                <CostRow label="Packing" value={inr(form.packing_cost)} />
+                <div className="border-t border-dashed border-slate-600 my-2" />
+                <CostRow label="Total cost" value={inr(costing.total)} bold />
+                <CostRow label="Margin" value={inr(costing.margin)} />
+                <CostRow label="Selling" value={inr(costing.sell)} bold accent />
+                <CostRow label={`GST ${form.gst_pct}%`} value={inr(costing.gst)} small />
+                <div className="border-t border-dashed border-slate-600 my-2" />
+                <CostRow label="Final / pair" value={inr(costing.final)} big />
+                <div className="mt-4 pt-3 border-t border-slate-700">
+                  <BtnPrimary onClick={save} className="w-full bg-[#C27842] border-[#C27842] hover:bg-[#A65D24]" data-testid="save-style-btn">
+                    <Save className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Save Style
+                  </BtnPrimary>
+                </div>
+              </div>
+            </div>
+          </div>
+        </Drawer>
+      )}
+    </div>
+  );
+}
+
+function Row({ label, value, bold, color }) {
+  return (
+    <div className="flex justify-between items-baseline">
+      <span className="text-slate-500 uppercase tracking-wider">{label}</span>
+      <span className={`font-mono ${bold ? "font-bold" : ""}`} style={color ? { color } : {}}>{value}</span>
+    </div>
+  );
+}
+function CostRow({ label, value, bold, big, small, accent }) {
+  return (
+    <div className={`flex justify-between items-baseline ${big ? "py-1" : "py-0.5"}`}>
+      <span className={`uppercase tracking-wider ${small ? "text-[10px] text-slate-500" : "text-xs text-slate-400"}`}>{label}</span>
+      <span className={`font-mono ${bold ? "font-bold" : ""} ${big ? "text-xl text-[#C27842]" : "text-sm"} ${accent ? "text-[#C27842]" : "text-white"}`}>{value}</span>
+    </div>
+  );
+}

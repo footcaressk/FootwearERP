@@ -1,0 +1,319 @@
+import { useEffect, useState, useMemo } from "react";
+import { http, inr } from "../lib/api";
+import { PageHeader, Card, BtnPrimary, BtnSecondary, Input, Select, Badge } from "../components/ui-kit";
+import { Drawer } from "./Materials";
+import { Plus, Upload, Trash2, Eye, Save, FileText, Loader2, Sparkles } from "lucide-react";
+
+const emptyLine = { style_code: "", description: "", color: "", size: "", hsn_code: "", quantity: 0, unit_price: 0, amount: 0 };
+const emptyPO = {
+  po_number: "", po_date: "", client_name: "", client_address: "", billing_address: "", shipping_address: "",
+  delivery_date: "", payment_terms: "", currency: "INR", line_items: [{ ...emptyLine }],
+  cgst_rate: 0, sgst_rate: 0, igst_rate: 0, notes: "",
+};
+
+export default function POs() {
+  const [pos, setPos] = useState([]);
+  const [open, setOpen] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const [form, setForm] = useState(emptyPO);
+  const [uploading, setUploading] = useState(false);
+  const [view, setView] = useState(null);
+
+  const load = async () => {
+    const { data } = await http.get("/pos");
+    setPos(data);
+  };
+  useEffect(() => { load(); }, []);
+
+  const startNew = () => { setEditId(null); setForm(emptyPO); setOpen(true); };
+  const onExtractFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const { data } = await http.post("/pos/extract", fd, { headers: { "Content-Type": "multipart/form-data" } });
+      setForm({
+        po_number: data.po_number || "",
+        po_date: data.po_date || "",
+        client_name: data.client_name || data.vendor_name || "",
+        client_address: data.client_address || "",
+        billing_address: data.billing_address || "",
+        shipping_address: data.shipping_address || "",
+        delivery_date: data.delivery_date || "",
+        payment_terms: data.payment_terms || "",
+        currency: data.currency || "INR",
+        line_items: (data.line_items && data.line_items.length ? data.line_items : [{ ...emptyLine }]).map((li) => ({
+          style_code: li.style_code || li.item_code || "",
+          description: li.description || "",
+          color: li.color || "",
+          size: String(li.size || ""),
+          hsn_code: li.hsn_code || "",
+          quantity: Number(li.quantity || 0),
+          unit_price: Number(li.unit_price || 0),
+          amount: Number(li.amount || Number(li.quantity || 0) * Number(li.unit_price || 0)),
+        })),
+        cgst_rate: Number(data.cgst_rate || 0),
+        sgst_rate: Number(data.sgst_rate || 0),
+        igst_rate: Number(data.igst_rate || 0),
+        notes: data.notes || "",
+      });
+      setEditId(null);
+      setOpen(true);
+    } catch (err) {
+      alert("Extraction failed: " + (err.response?.data?.detail || err.message));
+    } finally {
+      setUploading(false);
+      e.target.value = "";
+    }
+  };
+
+  const updateLine = (i, key, val) => setForm((f) => {
+    const li = f.line_items.map((r, idx) => idx === i ? { ...r, [key]: val } : r);
+    if (key === "quantity" || key === "unit_price") {
+      const row = li[i];
+      row.amount = Number(row.quantity || 0) * Number(row.unit_price || 0);
+    }
+    return { ...f, line_items: li };
+  });
+  const addLine = () => setForm((f) => ({ ...f, line_items: [...f.line_items, { ...emptyLine }] }));
+  const removeLine = (i) => setForm((f) => ({ ...f, line_items: f.line_items.filter((_, idx) => idx !== i) }));
+
+  const totals = useMemo(() => {
+    const subtotal = form.line_items.reduce((s, li) => s + Number(li.amount || 0), 0);
+    const cgst_amount = subtotal * Number(form.cgst_rate || 0) / 100;
+    const sgst_amount = subtotal * Number(form.sgst_rate || 0) / 100;
+    const igst_amount = subtotal * Number(form.igst_rate || 0) / 100;
+    const grand_total = subtotal + cgst_amount + sgst_amount + igst_amount;
+    const total_quantity = form.line_items.reduce((s, li) => s + Number(li.quantity || 0), 0);
+    return { subtotal, cgst_amount, sgst_amount, igst_amount, grand_total, total_quantity };
+  }, [form]);
+
+  const save = async () => {
+    const body = {
+      ...form,
+      line_items: form.line_items.map(li => ({
+        ...li, quantity: Number(li.quantity), unit_price: Number(li.unit_price), amount: Number(li.amount),
+      })),
+      cgst_rate: Number(form.cgst_rate), sgst_rate: Number(form.sgst_rate), igst_rate: Number(form.igst_rate),
+      cgst_amount: totals.cgst_amount, sgst_amount: totals.sgst_amount, igst_amount: totals.igst_amount,
+      subtotal: totals.subtotal, grand_total: totals.grand_total, total_quantity: totals.total_quantity,
+    };
+    if (editId) await http.patch(`/pos/${editId}`, body); else await http.post("/pos", body);
+    setOpen(false); load();
+  };
+
+  const remove = async (id) => {
+    if (!window.confirm("Delete this PO? Production jobs will also be removed.")) return;
+    await http.delete(`/pos/${id}`); load();
+  };
+
+  return (
+    <div>
+      <PageHeader
+        title="Purchase Orders"
+        subtitle="Orders / Purchase Orders"
+        testId="pos-header"
+        action={
+          <div className="flex gap-2 items-center">
+            <label className="bg-[#C27842] text-white font-bold uppercase tracking-wider text-xs px-5 py-2.5 border-2 border-[#C27842] shadow-ind hover:bg-[#A65D24] cursor-pointer flex items-center gap-2" data-testid="upload-po-label">
+              {uploading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+              {uploading ? "Extracting..." : "Upload PO (AI)"}
+              <input type="file" accept=".pdf,.xlsx,.xls" className="hidden" onChange={onExtractFile} disabled={uploading} data-testid="upload-po-input" />
+            </label>
+            <BtnPrimary onClick={startNew} data-testid="new-po-btn"><Plus className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> New PO</BtnPrimary>
+          </div>
+        }
+      />
+
+      <div className="p-8 space-y-4">
+        <div className="bg-[#1E3A8A] text-white p-4 flex items-center gap-3 border-2 border-[#1E3A8A]" data-testid="po-ai-banner">
+          <Sparkles className="w-5 h-5 text-[#C27842]" />
+          <div>
+            <div className="font-bold text-sm uppercase tracking-wider">AI-Powered PO Intake</div>
+            <div className="text-xs text-slate-300 mt-0.5">Upload any PDF or Excel purchase order — we'll auto-extract line items, sizes, tax breakdown and create production jobs automatically.</div>
+          </div>
+        </div>
+
+        <Card className="overflow-hidden">
+          <table className="w-full text-sm" data-testid="pos-table">
+            <thead className="bg-slate-50 border-b-2 border-slate-200">
+              <tr className="text-left text-[10px] uppercase tracking-wider text-slate-600">
+                <th className="px-4 py-3 font-bold">PO #</th>
+                <th className="px-4 py-3 font-bold">Date</th>
+                <th className="px-4 py-3 font-bold">Client</th>
+                <th className="px-4 py-3 font-bold text-right">Lines</th>
+                <th className="px-4 py-3 font-bold text-right">Qty</th>
+                <th className="px-4 py-3 font-bold text-right">Grand Total</th>
+                <th className="px-4 py-3 font-bold">Delivery</th>
+                <th className="px-4 py-3 font-bold text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pos.length === 0 ? (
+                <tr><td colSpan="8" className="px-6 py-10 text-center text-slate-400">No POs yet. Click "Upload PO (AI)" to import your first one.</td></tr>
+              ) : pos.map((p) => (
+                <tr key={p.id} className="border-b border-slate-100 hover:bg-slate-50">
+                  <td className="px-4 py-3 font-mono font-bold">{p.po_number}</td>
+                  <td className="px-4 py-3 text-xs">{p.po_date}</td>
+                  <td className="px-4 py-3">{p.client_name}</td>
+                  <td className="px-4 py-3 text-right font-mono">{p.line_items?.length || 0}</td>
+                  <td className="px-4 py-3 text-right font-mono">{p.total_quantity}</td>
+                  <td className="px-4 py-3 text-right font-mono font-bold">{inr(p.grand_total)}</td>
+                  <td className="px-4 py-3 text-xs">{p.delivery_date || "—"}</td>
+                  <td className="px-4 py-3 text-right">
+                    <button onClick={() => setView(p)} className="text-slate-600 hover:text-[#2563EB] p-1.5" data-testid={`view-po-${p.po_number}`}><Eye className="w-4 h-4" /></button>
+                    <button onClick={() => remove(p.id)} className="text-slate-600 hover:text-red-600 p-1.5 ml-1"><Trash2 className="w-4 h-4" /></button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      </div>
+
+      {open && (
+        <Drawer onClose={() => setOpen(false)} title={editId ? "Edit Purchase Order" : "New Purchase Order"} width="max-w-5xl">
+          <div className="space-y-4">
+            <div className="grid grid-cols-3 gap-3">
+              <Input label="PO Number" value={form.po_number} onChange={(e) => setForm({ ...form, po_number: e.target.value })} testId="form-po-number" />
+              <Input label="PO Date" type="date" value={form.po_date} onChange={(e) => setForm({ ...form, po_date: e.target.value })} />
+              <Input label="Delivery Date" type="date" value={form.delivery_date} onChange={(e) => setForm({ ...form, delivery_date: e.target.value })} />
+            </div>
+            <Input label="Client Name" value={form.client_name} onChange={(e) => setForm({ ...form, client_name: e.target.value })} testId="form-po-client" />
+            <div className="grid grid-cols-2 gap-3">
+              <Input label="Billing Address" value={form.billing_address} onChange={(e) => setForm({ ...form, billing_address: e.target.value })} />
+              <Input label="Shipping Address" value={form.shipping_address} onChange={(e) => setForm({ ...form, shipping_address: e.target.value })} />
+            </div>
+            <Input label="Payment Terms" value={form.payment_terms} onChange={(e) => setForm({ ...form, payment_terms: e.target.value })} />
+
+            <div className="flex items-baseline justify-between pt-3">
+              <h3 className="text-sm font-bold uppercase tracking-wider">Line Items</h3>
+              <button onClick={addLine} className="text-xs font-bold uppercase tracking-wider text-[#2563EB]" data-testid="add-line-btn">+ Add line</button>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs border-2 border-slate-200">
+                <thead className="bg-slate-50">
+                  <tr className="text-left">
+                    <th className="px-2 py-2 font-bold">Style</th>
+                    <th className="px-2 py-2 font-bold">Description</th>
+                    <th className="px-2 py-2 font-bold">Color</th>
+                    <th className="px-2 py-2 font-bold">Size</th>
+                    <th className="px-2 py-2 font-bold">HSN</th>
+                    <th className="px-2 py-2 font-bold text-right">Qty</th>
+                    <th className="px-2 py-2 font-bold text-right">Rate</th>
+                    <th className="px-2 py-2 font-bold text-right">Amount</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {form.line_items.map((li, i) => (
+                    <tr key={i} className="border-t border-slate-200">
+                      <td className="px-1 py-1"><input value={li.style_code} onChange={(e) => updateLine(i, "style_code", e.target.value)} className="w-28 border border-slate-300 px-1 py-0.5 font-mono" /></td>
+                      <td className="px-1 py-1"><input value={li.description} onChange={(e) => updateLine(i, "description", e.target.value)} className="w-44 border border-slate-300 px-1 py-0.5" /></td>
+                      <td className="px-1 py-1"><input value={li.color} onChange={(e) => updateLine(i, "color", e.target.value)} className="w-20 border border-slate-300 px-1 py-0.5" /></td>
+                      <td className="px-1 py-1"><input value={li.size} onChange={(e) => updateLine(i, "size", e.target.value)} className="w-12 border border-slate-300 px-1 py-0.5 text-center font-mono" /></td>
+                      <td className="px-1 py-1"><input value={li.hsn_code} onChange={(e) => updateLine(i, "hsn_code", e.target.value)} className="w-20 border border-slate-300 px-1 py-0.5 font-mono" /></td>
+                      <td className="px-1 py-1"><input type="number" value={li.quantity} onChange={(e) => updateLine(i, "quantity", e.target.value)} className="w-16 border border-slate-300 px-1 py-0.5 text-right font-mono" /></td>
+                      <td className="px-1 py-1"><input type="number" step="0.01" value={li.unit_price} onChange={(e) => updateLine(i, "unit_price", e.target.value)} className="w-20 border border-slate-300 px-1 py-0.5 text-right font-mono" /></td>
+                      <td className="px-2 py-1 text-right font-mono font-bold">{inr(li.amount)}</td>
+                      <td className="px-1 py-1"><button onClick={() => removeLine(i)} className="text-slate-500 hover:text-red-600"><Trash2 className="w-3.5 h-3.5" /></button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="grid grid-cols-2 gap-6 pt-3">
+              <div className="space-y-3">
+                <div className="grid grid-cols-3 gap-3">
+                  <Input label="CGST %" type="number" step="0.01" value={form.cgst_rate} onChange={(e) => setForm({ ...form, cgst_rate: e.target.value })} />
+                  <Input label="SGST %" type="number" step="0.01" value={form.sgst_rate} onChange={(e) => setForm({ ...form, sgst_rate: e.target.value })} />
+                  <Input label="IGST %" type="number" step="0.01" value={form.igst_rate} onChange={(e) => setForm({ ...form, igst_rate: e.target.value })} />
+                </div>
+                <Input label="Notes" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+              </div>
+              <div className="bg-[#0F172A] text-white p-5 border-2 border-[#0F172A]">
+                <div className="text-[10px] uppercase tracking-[0.2em] text-[#C27842] font-bold mb-3">Summary</div>
+                <Total label="Subtotal" value={inr(totals.subtotal)} />
+                <Total label="CGST" value={inr(totals.cgst_amount)} />
+                <Total label="SGST" value={inr(totals.sgst_amount)} />
+                <Total label="IGST" value={inr(totals.igst_amount)} />
+                <div className="border-t border-dashed border-slate-600 my-2" />
+                <Total label="Total Qty" value={totals.total_quantity} />
+                <Total label="Grand Total" value={inr(totals.grand_total)} big />
+              </div>
+            </div>
+
+            <div className="flex gap-2 pt-3 border-t border-slate-200">
+              <BtnPrimary onClick={save} data-testid="save-po-btn"><Save className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Save Purchase Order</BtnPrimary>
+              <BtnSecondary onClick={() => setOpen(false)}>Cancel</BtnSecondary>
+            </div>
+          </div>
+        </Drawer>
+      )}
+
+      {view && (
+        <Drawer onClose={() => setView(null)} title={`PO ${view.po_number}`} width="max-w-3xl">
+          <div className="space-y-4 text-sm">
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Client" value={view.client_name} />
+              <Field label="PO Date" value={view.po_date} />
+              <Field label="Delivery" value={view.delivery_date} />
+              <Field label="Payment Terms" value={view.payment_terms} />
+            </div>
+            <div>
+              <Field label="Billing" value={view.billing_address} />
+              <Field label="Shipping" value={view.shipping_address} />
+            </div>
+            <table className="w-full text-xs border-2 border-slate-200">
+              <thead className="bg-slate-50">
+                <tr className="text-left">
+                  <th className="px-2 py-2">Style</th><th className="px-2 py-2">Desc</th><th className="px-2 py-2">Color</th><th className="px-2 py-2">Size</th><th className="px-2 py-2 text-right">Qty</th><th className="px-2 py-2 text-right">Rate</th><th className="px-2 py-2 text-right">Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                {view.line_items.map((li, i) => (
+                  <tr key={i} className="border-t border-slate-200">
+                    <td className="px-2 py-1.5 font-mono">{li.style_code}</td>
+                    <td className="px-2 py-1.5">{li.description}</td>
+                    <td className="px-2 py-1.5">{li.color}</td>
+                    <td className="px-2 py-1.5 font-mono">{li.size}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{li.quantity}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{inr(li.unit_price)}</td>
+                    <td className="px-2 py-1.5 text-right font-mono font-bold">{inr(li.amount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="bg-slate-50 p-4 grid grid-cols-2 gap-2 text-xs">
+              <div>Subtotal: <span className="font-mono font-bold ml-2">{inr(view.subtotal)}</span></div>
+              <div>CGST: <span className="font-mono ml-2">{inr(view.cgst_amount)}</span></div>
+              <div>SGST: <span className="font-mono ml-2">{inr(view.sgst_amount)}</span></div>
+              <div>IGST: <span className="font-mono ml-2">{inr(view.igst_amount)}</span></div>
+              <div className="col-span-2 text-lg font-black border-t pt-2">Grand Total: <span className="font-mono text-[#C27842] ml-2">{inr(view.grand_total)}</span></div>
+            </div>
+          </div>
+        </Drawer>
+      )}
+    </div>
+  );
+}
+
+function Total({ label, value, big }) {
+  return (
+    <div className={`flex justify-between items-baseline ${big ? "py-1" : "py-0.5"}`}>
+      <span className="text-xs uppercase tracking-wider text-slate-400">{label}</span>
+      <span className={`font-mono ${big ? "text-xl font-bold text-[#C27842]" : "text-sm"}`}>{value}</span>
+    </div>
+  );
+}
+function Field({ label, value }) {
+  return (
+    <div className="border-b border-dashed border-slate-200 py-1.5">
+      <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">{label}</div>
+      <div className="text-sm">{value || "—"}</div>
+    </div>
+  );
+}
