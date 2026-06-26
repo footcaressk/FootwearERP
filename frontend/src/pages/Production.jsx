@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { http } from "../lib/api";
 import { PageHeader, Card, BtnPrimary, BtnSecondary } from "../components/ui-kit";
 import { useAuth } from "../lib/auth";
-import { FileDown, Check, UserPlus, Edit3, ClipboardList, X } from "lucide-react";
+import { FileDown, Check, UserPlus, Edit3, ClipboardList, X, HardHat, GripVertical } from "lucide-react";
 
 const STAGES = [
   { key: "procurement", label: "Procurement", color: "#64748B" },
@@ -31,6 +31,17 @@ const ASSIGNMENT_ROLES = [
   { key: "sole_pasting", label: "Sole Pasting" },
   { key: "finishing", label: "Finishing" },
 ];
+
+// Stage → most likely role mapping for bulk-drag assignment
+const STAGE_TO_ROLE = {
+  cutting: "cutting",
+  folding: "upper",
+  attachment: "upper",
+  stitching: "stitching",
+  lasting: "lasting",
+  sole_pasting: "sole_pasting",
+  finishing: "finishing",
+};
 
 const sortSizes = (a, b) => {
   const na = parseFloat(a), nb = parseFloat(b);
@@ -76,11 +87,15 @@ function aggregateAssignments(rows) {
 export default function Production() {
   const [jobs, setJobs] = useState([]);
   const [workers, setWorkers] = useState([]);
-  const [selected, setSelected] = useState({}); // for dispatched merge invoice
-  const [procSelected, setProcSelected] = useState({}); // for procurement merge requirement
+  const [selected, setSelected] = useState({});
+  const [procSelected, setProcSelected] = useState({});
   const [merging, setMerging] = useState(false);
-  const [assignFor, setAssignFor] = useState(null); // {group, role}
-  const [qtyFor, setQtyFor] = useState(null); // {group, rowId}
+  const [assignFor, setAssignFor] = useState(null);
+  const [qtyFor, setQtyFor] = useState(null);
+  const [dockOpen, setDockOpen] = useState(false);
+  const [draggingWorker, setDraggingWorker] = useState(null);
+  const [dropZone, setDropZone] = useState(null);
+  const [bulkConfirm, setBulkConfirm] = useState(null);
   const { user } = useAuth();
   const canEdit = ["admin", "manager", "production"].includes(user?.role);
 
@@ -151,6 +166,44 @@ export default function Production() {
     } catch (e) { alert("Material requirement failed: " + (e.response?.data?.detail || e.message)); }
   };
 
+  // ---- Drag & Drop bulk assignment ----
+  const onDragStartWorker = (w) => (e) => {
+    setDraggingWorker(w);
+    try { e.dataTransfer.setData("text/plain", w.id); } catch {}
+    e.dataTransfer.effectAllowed = "copy";
+  };
+  const onDragEndWorker = () => { setDraggingWorker(null); setDropZone(null); };
+  const onDragOverStage = (stageKey) => (e) => {
+    if (!draggingWorker) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    setDropZone(stageKey);
+  };
+  const onDropStage = (stageKey, stageJobs) => (e) => {
+    e.preventDefault();
+    const role = STAGE_TO_ROLE[stageKey];
+    if (!role || !draggingWorker || !stageJobs.length) { setDropZone(null); return; }
+    setBulkConfirm({
+      worker: draggingWorker, role, stageKey,
+      job_ids: stageJobs.map(j => j.id),
+      stage_label: STAGES.find(s => s.key === stageKey)?.label || stageKey,
+      card_count: groupJobsByColor(stageJobs).length,
+    });
+    setDropZone(null);
+  };
+  const runBulkAssign = async () => {
+    if (!bulkConfirm) return;
+    try {
+      await http.post("/production/bulk-assign", {
+        job_ids: bulkConfirm.job_ids,
+        role: bulkConfirm.role,
+        worker_id: bulkConfirm.worker.id,
+      });
+      setBulkConfirm(null);
+      load();
+    } catch (e) { alert("Bulk assignment failed: " + (e.response?.data?.detail || e.message)); }
+  };
+
   const dispatchedCount = Object.keys(selected).length;
   const procSelectedCount = Object.keys(procSelected).length;
 
@@ -161,7 +214,13 @@ export default function Production() {
         subtitle="Manufacturing / Kanban"
         testId="production-header"
         action={
-          <div className="flex gap-2">
+          <div className="flex gap-2 items-center">
+            {canEdit && (
+              <button onClick={() => setDockOpen(d => !d)} data-testid="toggle-karigar-dock"
+                className={`text-xs font-bold uppercase tracking-wider px-3 py-2 border-2 ${dockOpen ? "bg-[#C27842] text-white border-[#C27842]" : "bg-white text-slate-900 border-slate-300 hover:border-[#0F172A]"}`}>
+                <HardHat className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Karigars
+              </button>
+            )}
             {procSelectedCount > 0 && (
               <BtnPrimary onClick={() => { downloadMaterialRequirement(Object.values(procSelected), `${procSelectedCount} procurement cards`); setProcSelected({}); }} data-testid="merged-mr-btn">
                 <ClipboardList className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Material Requirement ({procSelectedCount})
@@ -188,13 +247,25 @@ export default function Production() {
               const isDisp = s.key === "dispatched";
               return (
                 <div key={s.key} className="w-[400px] flex-shrink-0" data-testid={`column-${s.key}`}>
-                  <div className="bg-white border-2 border-slate-200 border-t-4 mb-3 p-3" style={{ borderTopColor: s.color }}>
+                  <div
+                    className={`bg-white border-2 mb-3 p-3 transition-all ${dropZone === s.key ? "border-[#C27842] bg-orange-50 shadow-ind" : "border-slate-200"} border-t-4`}
+                    style={{ borderTopColor: s.color }}
+                    onDragOver={STAGE_TO_ROLE[s.key] ? onDragOverStage(s.key) : undefined}
+                    onDragLeave={() => setDropZone(null)}
+                    onDrop={STAGE_TO_ROLE[s.key] ? onDropStage(s.key, stageJobs) : undefined}
+                    data-testid={`column-header-${s.key}`}
+                  >
                     <div className="flex items-baseline justify-between">
                       <div className="font-bold uppercase tracking-wider text-sm">{s.label}</div>
                       <div className="font-mono text-xs text-slate-500">
                         {groups.length} · <span className="font-bold text-slate-900">{totalQty}</span>
                       </div>
                     </div>
+                    {STAGE_TO_ROLE[s.key] && draggingWorker && (
+                      <div className="mt-1 text-[10px] uppercase tracking-wider font-bold text-[#C27842]">
+                        Drop here → assign to {STAGE_TO_ROLE[s.key]} role on {groups.length} card(s)
+                      </div>
+                    )}
                   </div>
                   <div className="space-y-3">
                     {groups.length === 0 && (
@@ -251,6 +322,57 @@ export default function Production() {
           onSave={(body) => saveQuantity(qtyFor.rowId, body)}
           onClose={() => setQtyFor(null)}
         />
+      )}
+
+      {dockOpen && (
+        <div className="fixed left-64 right-0 bottom-0 bg-white border-t-2 border-slate-200 shadow-2xl z-40 p-3" data-testid="karigar-dock">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs uppercase tracking-[0.2em] font-bold text-slate-600">
+              Drag a karigar onto any stage column to assign them across all cards in that column
+            </div>
+            <button onClick={() => setDockOpen(false)} className="p-1 hover:bg-slate-100"><X className="w-4 h-4" /></button>
+          </div>
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {workers.length === 0 && <div className="text-xs text-slate-400 py-3">No karigars. Add some in the Karigars tab first.</div>}
+            {workers.filter(w => w.active !== false).map(w => (
+              <div
+                key={w.id}
+                draggable
+                onDragStart={onDragStartWorker(w)}
+                onDragEnd={onDragEndWorker}
+                data-testid={`drag-worker-${w.id}`}
+                className={`flex items-center gap-2 px-3 py-2 border-2 cursor-grab active:cursor-grabbing select-none ${draggingWorker?.id === w.id ? "border-[#C27842] bg-orange-50" : "border-slate-300 bg-white hover:border-[#0F172A]"}`}
+              >
+                <GripVertical className="w-3.5 h-3.5 text-slate-400" />
+                <div>
+                  <div className="font-bold text-sm leading-tight">{w.name}</div>
+                  <div className="text-[10px] uppercase tracking-wider text-slate-500">{w.skill} · ₹{w.rate_per_pair}/pr</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {bulkConfirm && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" data-testid="bulk-assign-dialog">
+          <div className="bg-white border-2 border-slate-200 shadow-2xl w-full max-w-md">
+            <div className="px-5 py-4 border-b-2 border-slate-200">
+              <div className="text-[10px] uppercase tracking-[0.2em] text-slate-500 font-bold">Bulk Assignment</div>
+              <div className="font-bold text-base">{bulkConfirm.worker.name} → {bulkConfirm.role.toUpperCase()}</div>
+            </div>
+            <div className="p-5 space-y-3">
+              <p className="text-sm text-slate-700">
+                Assign <b>{bulkConfirm.worker.name}</b> ({bulkConfirm.worker.skill}, ₹{bulkConfirm.worker.rate_per_pair}/pair) as the <b>{bulkConfirm.role}</b> karigar on <b>{bulkConfirm.card_count}</b> card(s) currently in <b>{bulkConfirm.stage_label}</b> stage?
+              </p>
+              <p className="text-xs text-slate-500">This will overwrite any existing {bulkConfirm.role} assignment on these cards. The full history is preserved.</p>
+              <div className="flex gap-2 pt-2 border-t border-slate-200">
+                <BtnPrimary onClick={runBulkAssign} data-testid="bulk-confirm-save"><Check className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Assign to all</BtnPrimary>
+                <BtnSecondary onClick={() => setBulkConfirm(null)}>Cancel</BtnSecondary>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

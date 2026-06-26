@@ -6,6 +6,8 @@ import AppShell from "@/pages/AppShell";
 import Dashboard from "@/pages/Dashboard";
 import Materials from "@/pages/Materials";
 import Workers from "@/pages/Workers";
+import Inventory from "@/pages/Inventory";
+import Payroll from "@/pages/Payroll";
 import Styles from "@/pages/Styles";
 import Costing from "@/pages/Costing";
 import POs from "@/pages/POs";
@@ -39,6 +41,8 @@ function App() {
             <Route index element={<Dashboard />} />
             <Route path="materials" element={<Materials />} />
             <Route path="workers" element={<Workers />} />
+            <Route path="inventory" element={<Inventory />} />
+            <Route path="payroll" element={<Payroll />} />
             <Route path="styles" element={<Styles />} />
             <Route path="costing" element={<Costing />} />
             <Route path="pos" element={<POs />} />

@@ -185,6 +185,21 @@ class QuantityUpdate(BaseModel):
     rejected_qty: Optional[int] = None
     reason: Optional[str] = ""
 
+class BulkAssign(BaseModel):
+    job_ids: List[str]
+    role: str
+    worker_id: Optional[str] = None
+
+class InventoryMovement(BaseModel):
+    material_id: str
+    type: Literal["in", "out", "adjustment"]  # in = stock-in (purchase), out = consumption, adjustment = correction
+    quantity: float
+    rate: Optional[float] = None  # unit rate at this movement (purchase price)
+    party: Optional[str] = ""  # supplier name for IN, job/po reference for OUT
+    job_id: Optional[str] = None  # if linked to a production job
+    notes: Optional[str] = ""
+    date: Optional[str] = ""  # ISO date
+
 class InvoiceGenerate(BaseModel):
     po_id: str
     job_ids: Optional[List[str]] = None  # if None, full PO; otherwise dispatched-only items
@@ -1062,6 +1077,226 @@ async def procurement_requirement_pdf(payload: dict, request: Request):
         BytesIO(pdf_bytes), media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="material-requirement-{datetime.now().strftime("%Y%m%d-%H%M")}.pdf"'},
     )
+
+
+# ---------- BULK ASSIGN ----------
+@api.post("/production/bulk-assign")
+async def bulk_assign(payload: BulkAssign, request: Request):
+    """Assign one karigar to multiple jobs at once for a specific role."""
+    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+    if not payload.job_ids:
+        raise HTTPException(400, "job_ids required")
+    worker_name = ""
+    if payload.worker_id:
+        w = await db.workers.find_one({"_id": oid(payload.worker_id)})
+        if not w:
+            raise HTTPException(404, "Worker not found")
+        worker_name = w.get("name", "")
+
+    obj_ids = []
+    for jid in payload.job_ids:
+        try:
+            obj_ids.append(oid(jid))
+        except HTTPException:
+            continue
+    jobs = await db.production_jobs.find({"_id": {"$in": obj_ids}}).to_list(2000)
+    affected = 0
+    for j in jobs:
+        assignments = j.get("assignments") or {}
+        if payload.worker_id:
+            assignments[payload.role] = {"worker_id": payload.worker_id, "worker_name": worker_name}
+        else:
+            assignments.pop(payload.role, None)
+        await db.production_jobs.update_one(
+            {"_id": j["_id"]},
+            {"$set": {"assignments": assignments, "updated_at": now_iso()},
+             "$push": {"history": {"event": "bulk_assignment", "role": payload.role,
+                                   "worker_id": payload.worker_id, "worker_name": worker_name,
+                                   "at": now_iso(), "by": u["email"]}}}
+        )
+        affected += 1
+    return {"affected": affected, "role": payload.role, "worker_id": payload.worker_id, "worker_name": worker_name}
+
+
+# ---------- INVENTORY ----------
+@api.get("/inventory")
+async def list_inventory(request: Request):
+    """List all materials with computed stock balance."""
+    await get_current_user(request)
+    materials = await db.materials.find({}).to_list(2000)
+    movements = await db.inventory_movements.find({}).to_list(20000)
+
+    # aggregate per material
+    bal = {}
+    last_in = {}
+    for m in movements:
+        mid = m.get("material_id")
+        if mid not in bal:
+            bal[mid] = {"in": 0, "out": 0, "adj": 0, "last_rate": 0, "last_date": ""}
+        if m["type"] == "in":
+            bal[mid]["in"] += m.get("quantity", 0)
+            bal[mid]["last_rate"] = m.get("rate") or bal[mid]["last_rate"]
+            bal[mid]["last_date"] = m.get("date") or m.get("created_at", "")
+            last_in[mid] = m
+        elif m["type"] == "out":
+            bal[mid]["out"] += m.get("quantity", 0)
+        else:
+            bal[mid]["adj"] += m.get("quantity", 0)
+
+    out = []
+    for mat in materials:
+        mat_id = str(mat["_id"])
+        b = bal.get(mat_id, {"in": 0, "out": 0, "adj": 0, "last_rate": 0, "last_date": ""})
+        stock = b["in"] - b["out"] + b["adj"]
+        out.append({
+            "material_id": mat_id,
+            "code": mat.get("code"),
+            "name": mat.get("name"),
+            "category": mat.get("category"),
+            "unit": mat.get("unit"),
+            "current_rate": mat.get("rate"),
+            "last_purchase_rate": b["last_rate"],
+            "last_purchase_date": b["last_date"],
+            "stock_in": round(b["in"], 2),
+            "stock_out": round(b["out"], 2),
+            "adjustments": round(b["adj"], 2),
+            "balance": round(stock, 2),
+            "value": round(stock * (b["last_rate"] or mat.get("rate", 0)), 2),
+        })
+    out.sort(key=lambda r: (r["category"] or "", r["name"] or ""))
+    return out
+
+
+@api.get("/inventory/movements")
+async def list_movements(request: Request, material_id: Optional[str] = None, limit: int = 200):
+    await get_current_user(request)
+    q = {}
+    if material_id:
+        q["material_id"] = material_id
+    docs = await db.inventory_movements.find(q).sort("created_at", -1).to_list(limit)
+    return [stringify(d) for d in docs]
+
+
+@api.post("/inventory/movements")
+async def create_movement(payload: InventoryMovement, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+    # validate material exists
+    try:
+        mat = await db.materials.find_one({"_id": oid(payload.material_id)})
+    except HTTPException:
+        mat = None
+    if not mat:
+        raise HTTPException(404, "Material not found")
+    doc = payload.model_dump()
+    doc["material_code"] = mat.get("code")
+    doc["material_name"] = mat.get("name")
+    doc["unit"] = mat.get("unit")
+    doc["created_at"] = now_iso()
+    doc["by"] = u["email"]
+    if not doc.get("date"):
+        doc["date"] = datetime.now(timezone.utc).date().isoformat()
+    res = await db.inventory_movements.insert_one(doc)
+    doc.pop("_id", None)
+    doc["id"] = str(res.inserted_id)
+    return doc
+
+
+@api.delete("/inventory/movements/{mid}")
+async def delete_movement(mid: str, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    await db.inventory_movements.delete_one({"_id": oid(mid)})
+    return {"ok": True}
+
+
+@api.post("/inventory/shortage")
+async def inventory_shortage(payload: dict, request: Request):
+    """Given job_ids, compute material requirement and compare with current stock to expose shortage."""
+    await get_current_user(request)
+    job_ids = payload.get("job_ids", [])
+    if not job_ids:
+        raise HTTPException(400, "job_ids required")
+    req = await _compute_material_requirement(job_ids)
+    # current stock map
+    bal_list = await list_inventory(request)
+    bal_map = {(b["code"], b["name"]): b for b in bal_list}
+    rows = []
+    for m in req["materials"]:
+        key = (m["code"], m["name"])
+        b = bal_map.get(key, {"balance": 0, "unit": m["unit"]})
+        shortage = max(0, m["total_qty_required"] - b.get("balance", 0))
+        rows.append({
+            "code": m["code"], "name": m["name"], "unit": m["unit"],
+            "required": m["total_qty_required"],
+            "in_stock": b.get("balance", 0),
+            "shortage": round(shortage, 2),
+            "purchase_cost_estimated": round(shortage * m["rate"], 2),
+        })
+    return {"jobs": req["jobs"], "shortage": rows}
+
+
+# ---------- REPORTS – PAYROLL ----------
+@api.get("/reports/payroll")
+async def report_payroll(request: Request, from_date: Optional[str] = None, to_date: Optional[str] = None):
+    """Per-karigar earnings = sum across jobs they're assigned to (per role) of completed_qty × worker rate.
+    If completed_qty == 0 and job is dispatched, use full quantity.
+    Optional date filter on job.updated_at.
+    """
+    await get_current_user(request)
+    workers = await db.workers.find({}).to_list(500)
+    worker_map = {str(w["_id"]): w for w in workers}
+
+    q = {}
+    if from_date:
+        q["updated_at"] = q.get("updated_at", {})
+        q["updated_at"]["$gte"] = from_date
+    if to_date:
+        q["updated_at"] = q.get("updated_at", {})
+        q["updated_at"]["$lte"] = to_date + "T23:59:59Z"
+    jobs = await db.production_jobs.find(q).to_list(5000)
+
+    earnings = {}  # worker_id -> {name, skill, total_pairs, total_earning, by_role:{}, jobs:[]}
+    for j in jobs:
+        comp = j.get("completed_qty", 0)
+        if not comp and j.get("stage") == "dispatched":
+            comp = j.get("quantity", 0)
+        if not comp:
+            continue
+        assigns = j.get("assignments") or {}
+        for role, a in assigns.items():
+            wid = a.get("worker_id")
+            if not wid:
+                continue
+            w = worker_map.get(wid)
+            if not w:
+                continue
+            rate = float(w.get("rate_per_pair", 0) or 0)
+            earn = rate * comp
+            if wid not in earnings:
+                earnings[wid] = {
+                    "worker_id": wid, "name": w.get("name", ""), "skill": w.get("skill", ""),
+                    "phone": w.get("phone", ""), "rate_per_pair": rate,
+                    "total_pairs": 0, "total_earning": 0.0, "by_role": {}, "jobs": []
+                }
+            earnings[wid]["total_pairs"] += comp
+            earnings[wid]["total_earning"] += earn
+            earnings[wid]["by_role"][role] = earnings[wid]["by_role"].get(role, 0) + comp
+            earnings[wid]["jobs"].append({
+                "po_number": j.get("po_number"), "style_code": j.get("style_code"),
+                "color": j.get("color"), "size": j.get("size"),
+                "role": role, "pairs": comp, "earning": round(earn, 2),
+            })
+
+    rows = list(earnings.values())
+    for r in rows:
+        r["total_earning"] = round(r["total_earning"], 2)
+    rows.sort(key=lambda r: r["total_earning"], reverse=True)
+    grand_total = round(sum(r["total_earning"] for r in rows), 2)
+    return {
+        "rows": rows,
+        "grand_total": grand_total,
+        "worker_count": len(rows),
+        "from_date": from_date, "to_date": to_date,
+    }
 
 
 # ---------- DEFECTS ----------
