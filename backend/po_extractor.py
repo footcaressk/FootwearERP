@@ -1,11 +1,25 @@
-"""AI-powered PO extraction from PDF / Excel files using Emergent LLM key + Gemini."""
-import os
+"""PO extraction — free local parsing first, optional LLM fallback.
+
+The local extractor (pdfplumber + openpyxl, in `po_extractor_free.py`) handles
+nearly every footwear PO format the user uploads. If it fails because the PDF
+is purely image-based or the layout is too exotic, we fall back to the
+Emergent-LLM Gemini call (only if `EMERGENT_LLM_KEY` is configured AND the
+fallback is enabled).
+"""
 import json
+import os
 import re
 import tempfile
 from pathlib import Path
-import openpyxl
-from emergentintegrations.llm.chat import LlmChat, UserMessage, FileContentWithMimeType
+
+from po_extractor_free import (
+    ExtractionFailed,
+    extract_po_from_pdf_local,
+    extract_po_from_xlsx_local,
+)
+
+
+_USE_LLM_FALLBACK = os.environ.get("PO_EXTRACTOR_LLM_FALLBACK", "true").lower() == "true"
 
 
 EXTRACTION_PROMPT = """You are an expert at extracting structured data from Purchase Order documents for footwear manufacturing.
@@ -59,73 +73,113 @@ Rules:
 - Return ONLY the JSON, no other text."""
 
 
-def xlsx_to_text(file_path: str) -> str:
-    wb = openpyxl.load_workbook(file_path, data_only=True)
-    parts = []
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        parts.append(f"### Sheet: {sheet_name}")
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c) if c is not None else "" for c in row]
-            if any(c.strip() for c in cells):
-                parts.append(" | ".join(cells))
-    return "\n".join(parts)
-
-
 def _clean_json(text: str) -> str:
-    text = text.strip()
+    text = (text or "").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
 
+def _validate(data: dict) -> bool:
+    """Treat the parse as successful when at least one usable line item came out."""
+    if not isinstance(data, dict):
+        return False
+    items = data.get("line_items") or []
+    return any((li.get("quantity") or 0) > 0 for li in items)
+
+
+# ---------------------- PUBLIC API (async) ----------------------
 async def extract_po_from_pdf(file_bytes: bytes) -> dict:
-    api_key = os.environ.get("EMERGENT_LLM_KEY")
-    if not api_key:
-        raise RuntimeError("EMERGENT_LLM_KEY not configured")
+    # 1) try the free local pipeline
+    try:
+        data = extract_po_from_pdf_local(file_bytes)
+        if _validate(data):
+            return data
+    except ExtractionFailed:
+        data = None
 
+    # 2) optional LLM fallback
+    if _USE_LLM_FALLBACK and os.environ.get("EMERGENT_LLM_KEY"):
+        try:
+            return await _llm_extract_pdf(file_bytes)
+        except Exception as e:
+            # Bubble the local-parser result if we have one even though it's weak
+            if data:
+                return data
+            raise RuntimeError(f"PO extraction failed (local + LLM): {e}") from e
+
+    # 3) nothing worked
+    if data:
+        return data
+    raise RuntimeError(
+        "Could not extract PO from this PDF locally and the LLM fallback is disabled. "
+        "Try uploading an Excel version of the PO, or set EMERGENT_LLM_KEY and "
+        "PO_EXTRACTOR_LLM_FALLBACK=true to enable AI fallback."
+    )
+
+
+async def extract_po_from_xlsx(file_bytes: bytes) -> dict:
+    try:
+        data = extract_po_from_xlsx_local(file_bytes)
+        if _validate(data):
+            return data
+    except ExtractionFailed:
+        data = None
+
+    if _USE_LLM_FALLBACK and os.environ.get("EMERGENT_LLM_KEY"):
+        try:
+            return await _llm_extract_xlsx(file_bytes)
+        except Exception as e:
+            if data:
+                return data
+            raise RuntimeError(f"PO extraction failed (local + LLM): {e}") from e
+
+    if data:
+        return data
+    raise RuntimeError("Could not extract PO from this Excel file (no recognisable line items).")
+
+
+# ---------------------- LLM FALLBACK (lazy import) ----------------------
+async def _llm_extract_pdf(file_bytes: bytes) -> dict:
+    from emergentintegrations.llm.chat import LlmChat, UserMessage, FileContentWithMimeType
+    api_key = os.environ["EMERGENT_LLM_KEY"]
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-
+        tmp.write(file_bytes); tmp_path = tmp.name
     try:
         chat = LlmChat(
             api_key=api_key,
             session_id=f"po-extract-{os.urandom(8).hex()}",
             system_message="You extract structured data from purchase orders and return strict JSON.",
         ).with_model("gemini", "gemini-2.5-flash")
-
-        file_attach = FileContentWithMimeType(file_path=tmp_path, mime_type="application/pdf")
-        response = await chat.send_message(
-            UserMessage(text=EXTRACTION_PROMPT, file_contents=[file_attach])
-        )
-        cleaned = _clean_json(response)
-        return json.loads(cleaned)
+        attach = FileContentWithMimeType(file_path=tmp_path, mime_type="application/pdf")
+        resp = await chat.send_message(UserMessage(text=EXTRACTION_PROMPT, file_contents=[attach]))
+        return json.loads(_clean_json(resp))
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
 
-async def extract_po_from_xlsx(file_bytes: bytes) -> dict:
-    api_key = os.environ.get("EMERGENT_LLM_KEY")
-    if not api_key:
-        raise RuntimeError("EMERGENT_LLM_KEY not configured")
-
+async def _llm_extract_xlsx(file_bytes: bytes) -> dict:
+    from emergentintegrations.llm.chat import LlmChat, UserMessage
+    import openpyxl
+    api_key = os.environ["EMERGENT_LLM_KEY"]
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-
+        tmp.write(file_bytes); tmp_path = tmp.name
     try:
-        text_content = xlsx_to_text(tmp_path)
+        wb = openpyxl.load_workbook(tmp_path, data_only=True)
+        parts = []
+        for sn in wb.sheetnames:
+            parts.append(f"### Sheet: {sn}")
+            for row in wb[sn].iter_rows(values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                if any(c.strip() for c in cells):
+                    parts.append(" | ".join(cells))
+        text_content = "\n".join(parts)
         chat = LlmChat(
             api_key=api_key,
             session_id=f"po-extract-{os.urandom(8).hex()}",
             system_message="You extract structured data from purchase orders and return strict JSON.",
         ).with_model("gemini", "gemini-2.5-flash")
-
-        response = await chat.send_message(
-            UserMessage(text=f"{EXTRACTION_PROMPT}\n\n--- Document Content ---\n{text_content}")
-        )
-        cleaned = _clean_json(response)
-        return json.loads(cleaned)
+        resp = await chat.send_message(UserMessage(text=f"{EXTRACTION_PROMPT}\n\n--- Document Content ---\n{text_content}"))
+        return json.loads(_clean_json(resp))
     finally:
         Path(tmp_path).unlink(missing_ok=True)

@@ -2,7 +2,7 @@ import { useEffect, useState, useMemo } from "react";
 import { http, inr } from "../lib/api";
 import { PageHeader, Card, BtnPrimary, BtnSecondary, Input, Select, Badge } from "../components/ui-kit";
 import { Drawer } from "./Materials";
-import { Plus, Upload, Trash2, Eye, Save, FileText, Loader2, Sparkles, FileDown, Truck } from "lucide-react";
+import { Plus, Upload, Trash2, Eye, Save, FileText, Loader2, Sparkles, FileDown, Truck, Package } from "lucide-react";
 
 import { API } from "../lib/api";
 
@@ -111,6 +111,22 @@ export default function POs() {
     await http.delete(`/pos/${id}`); load();
   };
 
+  const downloadPacking = async (po) => {
+    try {
+      const res = await http.post("/packing-lists/job", { po_id: po.id }, { responseType: "blob" });
+      const url = URL.createObjectURL(new Blob([res.data], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `PackingList-${po.po_number}.xlsx`;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert("Packing list failed: " + (e.response?.data?.detail || e.message));
+    }
+  };
+
   return (
     <div>
       <PageHeader
@@ -167,6 +183,7 @@ export default function POs() {
                   <td className="px-4 py-3 text-right">
                     <a href={`${API}/pos/${p.id}/invoice.pdf`} target="_blank" rel="noreferrer" className="text-slate-600 hover:text-[#C27842] p-1.5 inline-block" title="Download Tax Invoice" data-testid={`invoice-${p.po_number}`}><FileDown className="w-4 h-4" /></a>
                     <a href={`${API}/pos/${p.id}/challan.pdf`} target="_blank" rel="noreferrer" className="text-slate-600 hover:text-[#F97316] p-1.5 inline-block ml-1" title="Dispatch Challan" data-testid={`challan-${p.po_number}`}><Truck className="w-4 h-4" /></a>
+                    <button onClick={() => downloadPacking(p)} className="text-slate-600 hover:text-[#16A34A] p-1.5 ml-1" title="Generate Packing List" data-testid={`packing-${p.po_number}`}><Package className="w-4 h-4" /></button>
                     <button onClick={() => setView(p)} className="text-slate-600 hover:text-[#2563EB] p-1.5 ml-1" data-testid={`view-po-${p.po_number}`}><Eye className="w-4 h-4" /></button>
                     <button onClick={() => remove(p.id)} className="text-slate-600 hover:text-red-600 p-1.5 ml-1"><Trash2 className="w-4 h-4" /></button>
                   </td>

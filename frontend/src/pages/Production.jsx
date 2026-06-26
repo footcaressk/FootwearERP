@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { http } from "../lib/api";
 import { PageHeader, Card, BtnPrimary, BtnSecondary } from "../components/ui-kit";
 import { useAuth } from "../lib/auth";
-import { FileDown, Check, UserPlus, Edit3, ClipboardList, X, HardHat, GripVertical, Printer, MessageCircle, AlertTriangle, Clock } from "lucide-react";
+import { FileDown, Check, UserPlus, Edit3, ClipboardList, X, HardHat, GripVertical, Printer, MessageCircle, AlertTriangle, Clock, Package, Archive, Eye } from "lucide-react";
 
 const STAGES = [
   { key: "procurement", label: "Procurement", color: "#64748B" },
@@ -113,16 +113,20 @@ export default function Production() {
   const [dropZone, setDropZone] = useState(null);
   const [bulkConfirm, setBulkConfirm] = useState(null);
   const [waFor, setWaFor] = useState(null);
+  const [viewArchive, setViewArchive] = useState(false);
+  const [archivedJobs, setArchivedJobs] = useState([]);
+  const [detailFor, setDetailFor] = useState(null);
   const { user } = useAuth();
   const canEdit = ["admin", "manager", "production"].includes(user?.role);
 
   const load = async () => {
-    const [j, w, s] = await Promise.all([
+    const [j, w, s, ar] = await Promise.all([
       http.get("/production/jobs"),
       http.get("/workers"),
       http.get("/styles"),
+      http.get("/production/archive"),
     ]);
-    setJobs(j.data); setWorkers(w.data); setStyles(s.data);
+    setJobs(j.data); setWorkers(w.data); setStyles(s.data); setArchivedJobs(ar.data);
   };
   useEffect(() => { load(); }, []);
 
@@ -138,6 +142,28 @@ export default function Production() {
         { job_ids: group.rows.map(r => r.id) }, { responseType: "blob" });
       window.open(URL.createObjectURL(new Blob([res.data], { type: "application/pdf" })), "_blank");
     } catch (e) { alert("Print failed: " + (e.response?.data?.detail || e.message)); }
+  };
+
+  // Generate packing list for this single (PO, style, color) group.
+  // After generation, jobs are flagged `packing_generated_at`; if invoice is
+  // already done they auto-archive and disappear from the active board.
+  const downloadGroupPacking = async (group) => {
+    try {
+      const res = await http.post("/packing-lists/job",
+        { po_id: group.po_id, job_ids: group.rows.map(r => r.id) },
+        { responseType: "blob" });
+      const url = URL.createObjectURL(new Blob([res.data], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `PackingList-${group.po_number}-${group.style_code}-${(group.color || "color").replace(/\s+/g, "")}.xlsx`;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      load();
+    } catch (e) {
+      alert("Packing list failed: " + (e.response?.data?.detail || e.message));
+    }
   };
 
   // WhatsApp share: download production card PDF AND open WhatsApp Web with a
@@ -306,6 +332,10 @@ export default function Production() {
                 <HardHat className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Karigars
               </button>
             )}
+            <button onClick={() => setViewArchive(v => !v)} data-testid="toggle-archive"
+              className={`text-xs font-bold uppercase tracking-wider px-3 py-2 border-2 ${viewArchive ? "bg-[#0F172A] text-white border-[#0F172A]" : "bg-white text-slate-900 border-slate-300 hover:border-[#0F172A]"}`}>
+              <Archive className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Archive ({groupJobsByColor(archivedJobs).length})
+            </button>
             {procSelectedCount > 0 && (
               <BtnPrimary onClick={() => { downloadMaterialRequirement(Object.values(procSelected), `${procSelectedCount} procurement cards`); setProcSelected({}); }} data-testid="merged-mr-btn">
                 <ClipboardList className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Material Requirement ({procSelectedCount})
@@ -322,6 +352,15 @@ export default function Production() {
       />
 
       <div className="p-8">
+        {viewArchive ? (
+          <ArchivePanel
+            jobs={archivedJobs}
+            styleByCode={styleByCode}
+            onPrint={printCard}
+            onPacking={downloadGroupPacking}
+            onViewDetails={(g) => setDetailFor(g)}
+          />
+        ) : (
         <div className="overflow-x-auto pb-4">
           <div className="flex gap-4 min-w-max">
             {STAGES.map((s) => {
@@ -371,6 +410,7 @@ export default function Production() {
                         onOpenQty={(rowId) => setQtyFor({ group: g, rowId })}
                         onPrint={() => printCard(g)}
                         onWhatsApp={() => setWaFor({ group: g })}
+                        onPacking={() => downloadGroupPacking(g)}
                         isProc={isProc}
                         isDispatched={isDisp}
                         onMatReq={() => downloadMaterialRequirement([g], `${g.style_code} · ${g.color}`)}
@@ -387,7 +427,8 @@ export default function Production() {
             })}
           </div>
         </div>
-        {jobs.length === 0 && (
+        )}
+        {!viewArchive && jobs.length === 0 && (
           <Card className="p-12 text-center text-slate-400 mt-4">No production jobs yet.</Card>
         )}
       </div>
@@ -451,6 +492,10 @@ export default function Production() {
         />
       )}
 
+      {detailFor && (
+        <DetailModal group={detailFor} onClose={() => setDetailFor(null)} />
+      )}
+
       {bulkConfirm && (
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" data-testid="bulk-assign-dialog">
           <div className="bg-white border-2 border-slate-200 shadow-2xl w-full max-w-md">
@@ -485,7 +530,7 @@ export default function Production() {
 
 function ColorGroupCard(props) {
   const { group, style, stageColor, stageIdx, canEdit, onMove, onToggleComponent,
-    onOpenAssign, onOpenQty, onPrint, onWhatsApp, isProc, isDispatched, onMatReq,
+    onOpenAssign, onOpenQty, onPrint, onWhatsApp, onPacking, isProc, isDispatched, onMatReq,
     procSelected, onToggleProcSelect, isSelected, onToggleSelect, onDownloadInvoice } = props;
   const nextStage = STAGES[stageIdx + 1];
   const prevStage = STAGES[stageIdx - 1];
@@ -653,6 +698,11 @@ function ColorGroupCard(props) {
           {isDispatched && (
             <button onClick={() => onDownloadInvoice(group)} className="text-[10px] uppercase tracking-wider font-bold text-white bg-[#C27842] hover:bg-[#A65D24] px-3 py-1 flex items-center gap-1" data-testid={`invoice-btn-${group.key}`}>
               <FileDown className="w-3 h-3" /> Invoice
+            </button>
+          )}
+          {isDispatched && (
+            <button onClick={onPacking} className="text-[10px] uppercase tracking-wider font-bold text-white bg-[#16A34A] hover:bg-[#0F7A36] px-3 py-1 flex items-center gap-1" data-testid={`packing-btn-${group.key}`}>
+              <Package className="w-3 h-3" /> Packing List
             </button>
           )}
           {canEdit && prevStage && (
@@ -909,6 +959,193 @@ function WhatsAppDialog({ group, workers, onClose, onSend }) {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+
+/* -------------------- ARCHIVE PANEL -------------------- */
+function ArchivePanel({ jobs, styleByCode, onPrint, onPacking, onViewDetails }) {
+  const groups = groupJobsByColor(jobs);
+  if (groups.length === 0) {
+    return (
+      <Card className="p-12 text-center text-slate-400 text-sm" data-testid="archive-empty">
+        Nothing archived yet — once both <b>Invoice</b> and <b>Packing List</b> are generated for a card it moves here automatically.
+      </Card>
+    );
+  }
+  return (
+    <div className="space-y-3" data-testid="archive-list">
+      <Card className="bg-slate-50 border-2 border-slate-200 p-4">
+        <div className="flex items-baseline justify-between">
+          <div>
+            <h2 className="text-lg font-bold flex items-center gap-2"><Archive className="w-4 h-4 text-slate-700" /> Archived Production Cards</h2>
+            <p className="text-xs text-slate-600 mt-1">These groups have both invoice + packing list generated. Click <b>View details</b> to inspect the full production history.</p>
+          </div>
+          <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">
+            {groups.length} group{groups.length > 1 ? "s" : ""} · {jobs.length} job{jobs.length > 1 ? "s" : ""}
+          </div>
+        </div>
+      </Card>
+      <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4" data-testid="archive-grid">
+        {groups.map(g => (
+          <Card key={g.key} className="border-l-4 border-slate-400 hover:border-[#0F172A] transition-colors" data-testid={`archive-card-${g.key}`}>
+            {styleByCode[g.style_code]?.image_url && (
+              <div className="h-32 overflow-hidden bg-slate-100">
+                <img src={styleByCode[g.style_code].image_url} alt="" className="w-full h-full object-cover" />
+              </div>
+            )}
+            <div className="p-4">
+              <div className="flex items-baseline justify-between mb-2">
+                <div>
+                  <div className="font-mono text-xs text-slate-500">PO {g.po_number}</div>
+                  <div className="font-bold text-base">{g.style_code}</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">{g.color}</div>
+                  <div className="font-mono font-bold text-lg text-[#C27842]">{g.totalQty}</div>
+                </div>
+              </div>
+              <div className="text-xs text-slate-600 mb-1">
+                <span className="font-bold uppercase tracking-wider text-[10px] text-slate-500">Client:</span> {g.client_name}
+              </div>
+              <div className="text-xs text-slate-600 mb-3">
+                <span className="font-bold uppercase tracking-wider text-[10px] text-slate-500">Sizes:</span>{" "}
+                <span className="font-mono">{g.sizes.join(" · ")}</span>
+              </div>
+              <div className="flex gap-1 flex-wrap pt-2 border-t border-slate-200">
+                <button onClick={() => onViewDetails(g)} className="text-[10px] uppercase tracking-wider font-bold text-white bg-[#2563EB] hover:bg-[#1E40AF] px-2 py-1 flex items-center gap-1" data-testid={`archive-details-${g.key}`}>
+                  <Eye className="w-3 h-3" /> View details
+                </button>
+                <button onClick={() => onPrint(g)} className="text-[10px] uppercase tracking-wider font-bold text-slate-700 border border-slate-300 hover:bg-slate-900 hover:text-white px-2 py-1 flex items-center gap-1">
+                  <Printer className="w-3 h-3" /> Card PDF
+                </button>
+                <button onClick={() => onPacking(g)} className="text-[10px] uppercase tracking-wider font-bold text-[#16A34A] border border-[#16A34A] hover:bg-[#16A34A] hover:text-white px-2 py-1 flex items-center gap-1">
+                  <Package className="w-3 h-3" /> Packing
+                </button>
+              </div>
+            </div>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* -------------------- DETAIL MODAL -------------------- */
+function DetailModal({ group, onClose }) {
+  if (!group) return null;
+  const allHistory = group.rows.flatMap(r => (r.history || []).map(h => ({ ...h, size: r.size, qty: r.quantity })));
+  allHistory.sort((a, b) => new Date(a.at) - new Date(b.at));
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 grid place-items-center p-4" data-testid="detail-modal">
+      <div className="bg-white w-full max-w-4xl max-h-[90vh] overflow-y-auto border-2 border-slate-200 shadow-2xl">
+        <div className="bg-[#0F172A] text-white px-6 py-4 flex items-baseline justify-between">
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-[#C27842] font-bold">Production Card · Archive</div>
+            <div className="text-xl font-bold">{group.style_code} · {group.color} · {group.totalQty} pairs</div>
+          </div>
+          <button onClick={onClose} className="hover:bg-white/10 p-1" data-testid="detail-close"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="p-6 space-y-5">
+          <div className="grid grid-cols-2 gap-3 text-sm">
+            <DLPair label="PO Number" value={group.po_number} />
+            <DLPair label="Client" value={group.client_name} />
+            <DLPair label="Style" value={group.style_code} />
+            <DLPair label="Color" value={group.color} />
+            <DLPair label="Delivery" value={group.delivery_date || "—"} />
+            <DLPair label="Total Pairs" value={group.totalQty} />
+          </div>
+
+          <div>
+            <h3 className="text-sm font-bold uppercase tracking-wider mb-2">Size breakdown</h3>
+            <table className="w-full text-xs border-2 border-slate-200">
+              <thead className="bg-slate-50">
+                <tr className="text-left">
+                  <th className="px-3 py-2 font-bold">Size</th>
+                  <th className="px-3 py-2 font-bold text-right">Quantity</th>
+                  <th className="px-3 py-2 font-bold text-right">Completed</th>
+                  <th className="px-3 py-2 font-bold text-right">Rejected</th>
+                  <th className="px-3 py-2 font-bold">Final Stage</th>
+                </tr>
+              </thead>
+              <tbody>
+                {group.rows.map((r, i) => (
+                  <tr key={i} className="border-t border-slate-200">
+                    <td className="px-3 py-2 font-mono font-bold">{r.size || "—"}</td>
+                    <td className="px-3 py-2 text-right font-mono">{r.quantity}</td>
+                    <td className="px-3 py-2 text-right font-mono text-[#16A34A]">{r.completed_qty || 0}</td>
+                    <td className="px-3 py-2 text-right font-mono text-red-600">{r.rejected_qty || 0}</td>
+                    <td className="px-3 py-2 uppercase text-[10px] tracking-wider">{r.stage}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div>
+            <h3 className="text-sm font-bold uppercase tracking-wider mb-2">Karigar Assignments</h3>
+            <table className="w-full text-xs border-2 border-slate-200">
+              <thead className="bg-slate-50">
+                <tr className="text-left">
+                  <th className="px-3 py-2 font-bold">Role</th>
+                  <th className="px-3 py-2 font-bold">Karigar</th>
+                  <th className="px-3 py-2 font-bold text-right">Rate / Pair</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ASSIGNMENT_ROLES.map(role => {
+                  const a = group.assignments?.[role.key];
+                  return (
+                    <tr key={role.key} className="border-t border-slate-200">
+                      <td className="px-3 py-2 font-bold uppercase text-[10px] tracking-wider">{role.label}</td>
+                      <td className="px-3 py-2">{a?.worker_name || "—"}</td>
+                      <td className="px-3 py-2 text-right font-mono">{a?.rate_per_pair != null ? `₹${a.rate_per_pair}` : "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div>
+            <h3 className="text-sm font-bold uppercase tracking-wider mb-2">Stage History ({allHistory.length} entries)</h3>
+            <div className="border-2 border-slate-200 max-h-72 overflow-y-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-slate-50 sticky top-0">
+                  <tr className="text-left">
+                    <th className="px-3 py-2 font-bold">When</th>
+                    <th className="px-3 py-2 font-bold">Size</th>
+                    <th className="px-3 py-2 font-bold">Stage</th>
+                    <th className="px-3 py-2 font-bold">By</th>
+                    <th className="px-3 py-2 font-bold">Notes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {allHistory.map((h, i) => (
+                    <tr key={i} className="border-t border-slate-100">
+                      <td className="px-3 py-1.5 font-mono text-[10px] text-slate-600 whitespace-nowrap">{h.at ? new Date(h.at).toLocaleString("en-IN", { hour12: false }) : "—"}</td>
+                      <td className="px-3 py-1.5 font-mono">{h.size}</td>
+                      <td className="px-3 py-1.5 font-bold uppercase text-[10px] tracking-wider">{h.stage}</td>
+                      <td className="px-3 py-1.5 text-slate-600">{h.by}</td>
+                      <td className="px-3 py-1.5">{h.notes || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DLPair({ label, value }) {
+  return (
+    <div className="border-b border-dashed border-slate-200 pb-2">
+      <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">{label}</div>
+      <div className="font-mono font-bold">{value || "—"}</div>
     </div>
   );
 }

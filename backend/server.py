@@ -22,6 +22,7 @@ from auth import (
 )
 from po_extractor import extract_po_from_pdf, extract_po_from_xlsx
 from pdf_docs import generate_dispatch_challan_pdf, build_invoice
+from packing_list import build_default_packing_list, build_from_template
 from pdf_procurement import build_material_requirement
 from pdf_card import build_production_card
 from fastapi.responses import StreamingResponse
@@ -233,6 +234,22 @@ class InvoiceGenerate(BaseModel):
     transport_mode: Optional[str] = ""
     vehicle_no: Optional[str] = ""
     supply_date: Optional[str] = ""
+
+
+class PackingListGenerate(BaseModel):
+    po_id: str
+    job_ids: Optional[List[str]] = None
+    template_id: Optional[str] = None  # use a saved per-client template
+    carton_dim: Optional[str] = "60x50x30 CMS"
+    pcs_per_box: Optional[int] = 20
+    net_wt_per_carton: Optional[float] = 10.8
+    gross_wt_per_carton: Optional[float] = 12.0
+
+
+class PackingTemplateIn(BaseModel):
+    client_name: str
+    name: str   # human-friendly label
+    file_b64: str  # base64-encoded xlsx file contents
 
 class DefectIn(BaseModel):
     po_number: str
@@ -714,6 +731,8 @@ async def invoice_for_jobs(payload: InvoiceGenerate, request: Request):
         "supply_date": payload.supply_date,
         "by": u["email"], "created_at": now_iso(),
     })
+    # Flag jobs as invoiced; auto-archive if packing list already generated.
+    await _flag_jobs(payload.job_ids or [], "invoice_generated_at")
     return StreamingResponse(
         BytesIO(pdf_bytes), media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{invoice_no}.pdf"'},
@@ -771,6 +790,7 @@ async def merged_invoice(payload: dict, request: Request):
         "line_items_snapshot": all_items,
         "by": u["email"], "created_at": now_iso(),
     })
+    await _flag_jobs(job_ids_all, "invoice_generated_at")
     return StreamingResponse(
         BytesIO(pdf_bytes), media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{invoice_no}.pdf"'},
@@ -791,6 +811,111 @@ async def po_challan(pid: str, request: Request, dispatch_qty: Optional[int] = N
         BytesIO(pdf_bytes), media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="challan-{po.get("po_number","po")}.pdf"'},
     )
+
+
+# ---------- PACKING LIST ----------
+async def _build_packing_payload(po: dict, job_ids: list[str] | None) -> dict:
+    """Build a PO-like dict suitable for the packing list generator. If job_ids
+    are supplied, line_items are rebuilt from those dispatched jobs (lets the
+    user generate a packing list for a single colour/size group, etc.)."""
+    po_aug, items = await _generate_invoice_payload(po, job_ids)
+    out = dict(po_aug)
+    out["line_items"] = items
+    out["total_quantity"] = sum((li.get("quantity") or 0) for li in items)
+    return out
+
+
+@api.post("/packing-lists/job")
+async def generate_packing_list(payload: PackingListGenerate, request: Request):
+    """Generate a packing-list xlsx. If `template_id` is set, use the per-client
+    template; otherwise emit the default SSK format."""
+    u = await get_current_user(request); require_roles("admin", "manager", "sales")(u)
+    po_doc = await db.pos.find_one({"_id": oid(payload.po_id)})
+    if not po_doc:
+        raise HTTPException(404, "PO not found")
+    po = stringify(po_doc)
+    payload_po = await _build_packing_payload(po, payload.job_ids)
+    options = {
+        "carton_dim": payload.carton_dim,
+        "pcs_per_box": payload.pcs_per_box,
+        "net_wt_per_carton": payload.net_wt_per_carton,
+        "gross_wt_per_carton": payload.gross_wt_per_carton,
+    }
+
+    if payload.template_id:
+        tdoc = await db.packing_templates.find_one({"_id": oid(payload.template_id)})
+        if not tdoc:
+            raise HTTPException(404, "Template not found")
+        import base64 as b64
+        try:
+            tpl_bytes = b64.b64decode(tdoc["file_b64"])
+        except Exception as e:
+            raise HTTPException(400, f"Bad template file: {e}")
+        xlsx_bytes = build_from_template(tpl_bytes, payload_po, options)
+    else:
+        xlsx_bytes = build_default_packing_list(payload_po, options)
+
+    # Persist the record + flag affected jobs
+    rec = {
+        "po_id": payload.po_id, "po_number": po.get("po_number"),
+        "client_name": po.get("client_name"),
+        "job_ids": payload.job_ids or [],
+        "template_id": payload.template_id,
+        "options": options, "by": u["email"], "created_at": now_iso(),
+    }
+    await db.packing_lists.insert_one(rec)
+    await _flag_jobs(payload.job_ids or [], "packing_generated_at")
+
+    fname = f"PackingList-{po.get('po_number','po')}-{datetime.now().strftime('%Y%m%d-%H%M')}.xlsx"
+    return StreamingResponse(
+        BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@api.get("/packing-templates")
+async def list_packing_templates(request: Request):
+    await get_current_user(request)
+    docs = await db.packing_templates.find({}, {"file_b64": 0}).to_list(200)
+    return [stringify(d) for d in docs]
+
+
+@api.post("/packing-templates")
+async def create_packing_template(payload: PackingTemplateIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    # Lightweight sanity check the file is a valid xlsx
+    import base64 as b64
+    try:
+        raw = b64.b64decode(payload.file_b64.split(",", 1)[-1] if "," in payload.file_b64 else payload.file_b64)
+        # try loading
+        import io as _io
+        import openpyxl as _ox
+        _ox.load_workbook(_io.BytesIO(raw))
+    except Exception as e:
+        raise HTTPException(400, f"Invalid xlsx file: {e}")
+
+    doc = {
+        "client_name": payload.client_name.strip(),
+        "name": payload.name.strip(),
+        "file_b64": payload.file_b64,
+        "by": u["email"],
+        "created_at": now_iso(),
+    }
+    res = await db.packing_templates.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    safe = stringify(doc)
+    safe.pop("file_b64", None)
+    return safe
+
+
+@api.delete("/packing-templates/{tid}")
+async def delete_packing_template(tid: str, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    res = await db.packing_templates.delete_one({"_id": oid(tid)})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Template not found")
+    return {"ok": True}
 
 
 # ---------- REPORTS ----------
@@ -985,10 +1110,58 @@ async def report_karigar_output(request: Request,
 
 # ---------- PRODUCTION ----------
 @api.get("/production/jobs")
-async def list_jobs(request: Request):
+async def list_jobs(request: Request, include_archived: bool = False):
     await get_current_user(request)
-    docs = await db.production_jobs.find({}).sort("created_at", -1).to_list(2000)
+    q: dict = {}
+    if not include_archived:
+        # Hide jobs that have both invoice + packing list generated
+        q = {"archived": {"$ne": True}}
+    docs = await db.production_jobs.find(q).sort("created_at", -1).to_list(2000)
     return [stringify(d) for d in docs]
+
+
+@api.get("/production/archive")
+async def list_archive(request: Request):
+    """Return groups (po, style, color) that have been invoiced AND packed and are archived."""
+    await get_current_user(request)
+    docs = await db.production_jobs.find({"archived": True}).sort("archived_at", -1).to_list(2000)
+    return [stringify(d) for d in docs]
+
+
+def _archive_if_complete(job_update: dict) -> None:
+    """Mutate `job_update` in-place: if it now has both invoice_generated_at and
+    packing_generated_at, mark archived=True."""
+    if job_update.get("invoice_generated_at") and job_update.get("packing_generated_at"):
+        job_update["archived"] = True
+        job_update["archived_at"] = now_iso()
+
+
+async def _flag_jobs(job_ids: list, field: str) -> None:
+    """Mark a batch of jobs with a timestamped field. If the other flag is also
+    present, additionally mark archived=True/archived_at."""
+    if not job_ids:
+        return
+    obj_ids = []
+    for jid in job_ids:
+        try:
+            obj_ids.append(oid(jid))
+        except HTTPException:
+            continue
+    now = now_iso()
+    # Bulk update – set the timestamp
+    await db.production_jobs.update_many(
+        {"_id": {"$in": obj_ids}},
+        {"$set": {field: now}},
+    )
+    # Then for each job, check if both flags are now set → archive
+    docs = await db.production_jobs.find({"_id": {"$in": obj_ids}}).to_list(2000)
+    archive_ids = [d["_id"] for d in docs if d.get("invoice_generated_at") and d.get("packing_generated_at")]
+    if archive_ids:
+        await db.production_jobs.update_many(
+            {"_id": {"$in": archive_ids}},
+            {"$set": {"archived": True, "archived_at": now}},
+        )
+
 
 @api.patch("/production/jobs/{jid}")
 async def update_job(jid: str, payload: ProductionStageUpdate, request: Request):
