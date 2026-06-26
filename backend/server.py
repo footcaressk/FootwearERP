@@ -83,6 +83,7 @@ class MaterialIn(BaseModel):
     category: Literal["upper", "sole", "lining", "accessory", "consumable", "packing", "other"]
     unit: str
     rate: float
+    reorder_level: float = 0
     notes: Optional[str] = ""
 
 class BomItem(BaseModel):
@@ -199,11 +200,6 @@ class QuantityUpdate(BaseModel):
     completed_qty: Optional[int] = None
     rejected_qty: Optional[int] = None
     reason: Optional[str] = ""
-
-class BulkAssign(BaseModel):
-    job_ids: List[str]
-    role: str
-    worker_id: Optional[str] = None
 
 class InventoryMovement(BaseModel):
     material_id: str
