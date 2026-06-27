@@ -3,7 +3,7 @@ import { http, inr } from "../lib/api";
 import { PageHeader, StatTile, Card, BtnSecondary } from "../components/ui-kit";
 import { Link } from "react-router-dom";
 import { useAuth } from "../lib/auth";
-import { AlertTriangle, Clock, ArrowRight } from "lucide-react";
+import { AlertTriangle, Clock, ArrowRight, Receipt } from "lucide-react";
 
 const STAGE_COLORS = {
   procurement: "#64748B", cutting: "#2563EB", folding: "#0284C7",
@@ -20,11 +20,13 @@ const STAGE_LABEL = {
 export default function Dashboard() {
   const [stats, setStats] = useState(null);
   const [overdue, setOverdue] = useState([]);
+  const [overdueInvoices, setOverdueInvoices] = useState([]);
   const { user } = useAuth();
 
   useEffect(() => {
     http.get("/dashboard/stats").then((r) => setStats(r.data)).catch(() => {});
     http.get("/dashboard/overdue").then((r) => setOverdue(r.data || [])).catch(() => {});
+    http.get("/invoices/overdue").then((r) => setOverdueInvoices(r.data || [])).catch(() => {});
   }, []);
 
   const seedDemo = async () => {
@@ -52,6 +54,21 @@ export default function Dashboard() {
       />
 
       <div className="p-8 space-y-6">
+        {overdueInvoices.length > 0 && (
+          <Card className="bg-red-50 border-2 border-red-300 px-5 py-3 flex items-center justify-between" data-testid="overdue-invoices-banner">
+            <div className="flex items-center gap-3">
+              <Receipt className="w-5 h-5 text-red-600" />
+              <div>
+                <div className="font-bold text-red-700 text-sm">
+                  {overdueInvoices.length} overdue payment{overdueInvoices.length > 1 ? "s" : ""} · {inr(overdueInvoices.reduce((s, r) => s + (r.outstanding || 0), 0))} receivable
+                </div>
+                <div className="text-xs text-red-600">Payment terms exceeded — review and chase up.</div>
+              </div>
+            </div>
+            <Link to="/invoices" className="text-xs uppercase tracking-wider font-bold text-red-700 hover:underline">Open invoices →</Link>
+          </Card>
+        )}
+
         {overdue.length > 0 && (
           <Card className="bg-red-50 border-2 border-red-300 overflow-hidden" data-testid="overdue-alert-banner">
             <div className="bg-red-600 text-white px-5 py-2 flex items-baseline justify-between">
