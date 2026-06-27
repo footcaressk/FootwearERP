@@ -2983,7 +2983,11 @@ app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["*"],
+    allow_origins=list(set([
+        "http://localhost:3000",
+        "https://localhost:3000",
+        os.getenv("FRONTEND_URL", "http://localhost:3000")
+    ])),
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
