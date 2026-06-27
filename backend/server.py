@@ -2978,6 +2978,13 @@ async def seed_demo(request: Request):
 
 
 # ---------- App wiring ----------
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to SSK Footwear ERP API! 🚀",
+        "docs": "Visit /docs for the API documentation."
+    }
+
 app.include_router(api)
 
 app.add_middleware(
