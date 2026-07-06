@@ -281,8 +281,7 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Phase 5 — Style Lifecycle endpoints (backend)"
-    - "Phase 5 — Online Style Pipeline frontend"
+    - "Phase 5 — Online Style Pipeline frontend (awaiting user confirmation to run UI tests)"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
