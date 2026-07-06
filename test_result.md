@@ -280,10 +280,28 @@ metadata:
   run_ui: false
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Phase 5 — Style Lifecycle endpoints (backend)"
+    - "Phase 5 — Online Style Pipeline frontend"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
+
+backend:
+  - task: "Phase 5 — Style Lifecycle: models, resolver, endpoints"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "New collection `style_lifecycle` keyed by style_id (unique index). Adds online_status enum + forward-only transition validator (side-branches archived/liquidation_candidate always reachable). Endpoints: GET /api/style-lifecycle/{style_id} (auto-init draft), PUT /api/style-lifecycle/{style_id} (upsert lifecycle fields incl. planned_colors/sizes/components, MRP, sale_channels, sole info, photoshoot/catalogue links), PATCH /api/styles/{sid}/online-status (validated transitions; on first live: generate back_track_number='{code}-{YYYYMMDD}-{seq}', set went_live_at=now, auto-seed fg_inventory rows for each planned (color,size) at ready=0, min=planned_min_stock), GET /api/styles/online (pipeline listing with channel_skus from sku_map joined; filter by online_status/sale_channel/search). Smoke-tested via curl end-to-end: draft→sample_approved→photoshoot_completed→catalog_completed→price_finalized→ready_for_launch→live→archived; invalid two-step jump correctly rejected with 400; live→live no-op works; back_track SSK-DEMO-20260706-001 generated; 12 FG rows seeded (2 colors × 6 sizes)."
+        - working: true
+          agent: "testing"
+          comment: "✅ PHASE 5 STYLE LIFECYCLE BACKEND TESTING COMPLETE. All 15/15 tests passed (100% success rate). Comprehensive testing of all Phase 5 endpoints: (1) GET /api/style-lifecycle/{style_id} auto-initializes draft doc with all required fields (online_status='draft', history entry by='system', sale_channels=[], planned_min_stock=25, all 6 planned_components at qty=0, empty planned_colors/sizes, back_track_number='', went_live_at=null) ✓ (2) PUT /api/style-lifecycle/{style_id} upserts lifecycle fields correctly (sale_channels, mrp, online_selling_price, platform_commission_pct, planned_colors/sizes, planned_components normalized to include ALL 6 components with missing ones at qty=0, sole info, photoshoot_link), online_status NOT changed by PUT, GET after PUT returns same values ✓ (3a) PATCH /api/styles/{sid}/online-status: draft→sample_approved with notes → 200, new history entry appended with from='draft', by=admin email, notes preserved ✓ (3b) sample_approved→live (skip stages) → 400 with error mentioning next allowed stage ✓ (3c) Walk forward through pipeline: sample_approved→photoshoot_completed→catalog_completed→price_finalized→ready_for_launch→live (all transitions return 200) ✓ (3d) Transition to 'live' generates back_track_number matching regex ^{style_code}-\\d{8}-\\d{3}$, sets went_live_at timestamp, seeds 12 FG inventory rows (2 colors × 6 sizes) with ready_stock_qty=0 and min_stock_level=25 ✓ (3e) live→live (no-op) → 200, seed_result null/absent (not re-seeded) ✓ (3f) live→archived (side-branch) → 200 ✓ (3g) archived→draft (unarchive) → 400 with 'Cannot transition from side-branch' error ✓ (3h) draft→liquidation_candidate (side-branch) → 200 ✓ (4a) GET /api/styles/online (no filter) returns all styles with all required fields (style_id, style_code, style_name, image_url, online_status, online_status_history, sale_channels, mrp, online_selling_price, planned_colors/sizes/components, back_track_number, went_live_at, channel_skus) ✓ (4b) Filter by online_status=archived returns only archived styles ✓ (4c) Filter by sale_channel=myntra returns only styles with 'myntra' in sale_channels ✓ (5) Unique index on style_lifecycle.style_id verified (multiple GETs don't create duplicates) ✓ (6) Regression smoke: POST /api/fg-inventory/movements, GET /api/fg-inventory, GET /api/sku-map, POST /api/sku-map, GET /api/sku-map/unmapped all work with Bearer auth ✓. No issues found. All Phase 5 Style Lifecycle endpoints working as specified."
 
 agent_communication:
     - agent: "main"
@@ -299,3 +317,6 @@ agent_communication:
 
     - agent: "testing"
       message: "✅ BULK STOCK-ENTRY ENDPOINTS TESTING COMPLETE. All 10 tests passed (100% success rate). Tested: (1) POST /api/fg-inventory/bulk-movements happy path with 3 movements → all applied correctly with proper deltas and inventory verification ✓ (2) Partial-success scenario with 1 valid + 2 invalid movements → valid one applied, invalid ones returned with error messages ✓ (3) Batch size limit enforcement → 2001 movements correctly rejected with 400 'max 2000' ✓ (4) Empty list validation → correctly rejected with 400 ✓ (5) GET /api/fg-inventory/csv-template → correct Content-Type, Content-Disposition, and headers ✓ (6) CSV import dry_run with UTF-8 BOM, mixed valid/invalid rows, qty=0 skip → parsed correctly, no writes performed ✓ (7) CSV import commit → movements applied, ledger updated, inventory verified ✓ (8) CSV missing required column → per-line errors returned ✓ (9) CSV adjustment without adjustment_field → validation error returned ✓ (10) Regression smoke test → all previously-passing Phase 2 endpoints (POST /movements single, GET /fg-inventory, GET /by-style) still work with Bearer auth ✓. No issues found. All bulk and CSV import flows working as specified."
+
+    - agent: "testing"
+      message: "✅ PHASE 5 STYLE LIFECYCLE BACKEND TESTING COMPLETE — ALL 15/15 TESTS PASSED. Comprehensive verification of all Phase 5 endpoints completed successfully. Tested: (1) GET /api/style-lifecycle/{style_id} auto-init with all required fields ✓ (2) PUT /api/style-lifecycle/{style_id} upserts lifecycle fields, normalizes planned_components to all 6 components, doesn't change online_status ✓ (3) PATCH /api/styles/{sid}/online-status with validated transitions: draft→sample_approved with notes ✓, skip-stages correctly blocked with 400 ✓, full pipeline walk-through (sample_approved→photoshoot_completed→catalog_completed→price_finalized→ready_for_launch→live) ✓, live transition generates back_track_number (regex ^{code}-\\d{8}-\\d{3}$) and seeds FG inventory (12 rows: 2 colors × 6 sizes at ready=0, min=25) ✓, live→live no-op (no re-seed) ✓, side-branches (live→archived, draft→liquidation_candidate) allowed ✓, unarchive correctly blocked ✓ (4) GET /api/styles/online with filters (no filter, by status, by channel) all working ✓ (5) Unique index verified ✓ (6) Regression smoke on Phase 2/3 endpoints (movements, fg-inventory, sku-map) all working ✓. No issues found. All Phase 5 Style Lifecycle backend endpoints working perfectly as specified."

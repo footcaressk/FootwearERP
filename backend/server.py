@@ -547,6 +547,52 @@ class SkuMapUpdate(BaseModel):
     size_map:  Optional[Dict[str, str]] = None
 
 
+# ---------- Style Lifecycle (Online branch) models ----------
+OnlineStatus = Literal[
+    "draft", "sample_approved", "photoshoot_completed", "catalog_completed",
+    "price_finalized", "ready_for_launch", "live",
+    "liquidation_candidate", "archived",
+]
+
+# Ordered pipeline; used to enforce forward-only transitions.
+ONLINE_STATUS_SEQUENCE = [
+    "draft", "sample_approved", "photoshoot_completed", "catalog_completed",
+    "price_finalized", "ready_for_launch", "live",
+]
+# Terminal / side-branch statuses reachable from anywhere.
+ONLINE_STATUS_SIDE_BRANCHES = {"liquidation_candidate", "archived"}
+
+PLANNED_COMPONENTS = ["upper", "bottom", "sole", "insole", "lace", "box"]
+
+
+class PlannedComponent(BaseModel):
+    component: Literal["upper", "bottom", "sole", "insole", "lace", "box"]
+    planned_qty: int = 0
+
+
+class StyleLifecycleUpsert(BaseModel):
+    """PUT /style-lifecycle/{style_id} — upsert-safe partial update.
+    All fields optional; the endpoint upserts a doc keyed by style_id."""
+    sale_channels:            Optional[List[Literal["myntra", "flipkart", "nykaa", "website"]]] = None
+    mrp:                      Optional[float] = None
+    online_selling_price:     Optional[float] = None
+    platform_commission_pct:  Optional[Dict[str, float]] = None          # e.g. {"myntra": 32.5}
+    planned_min_stock:        Optional[int] = None
+    planned_components:       Optional[List[PlannedComponent]] = None
+    planned_colors:           Optional[List[str]] = None                 # colors to seed on go-live
+    planned_sizes:            Optional[List[str]] = None                 # sizes  to seed on go-live
+    sole_mould_name:          Optional[str] = None
+    sole_shape:               Optional[str] = None
+    pattern_number:           Optional[str] = None
+    photoshoot_link:          Optional[str] = None
+    catalogue_link:           Optional[str] = None
+
+
+class OnlineStatusPatchIn(BaseModel):
+    to_status: OnlineStatus
+    notes:     Optional[str] = ""
+
+
 class FgInventoryIn(BaseModel):
     style_id: str
     color: str
@@ -1157,6 +1203,363 @@ async def sku_map_unmapped(request: Request):
     result = list(groups.values())
     result.sort(key=lambda g: -g["job_count"])
     return result
+
+
+# ---------- STYLE LIFECYCLE (Online branch) ----------
+#
+# A separate collection `style_lifecycle`, keyed by style_id, so the B2B style
+# doc remains untouched. Every style may or may not have a lifecycle doc — the
+# GET endpoint auto-creates a "draft" doc so the pipeline UI always has a row.
+
+
+def _default_lifecycle(style_id: str, style_code: str) -> dict:
+    now = now_iso()
+    return {
+        "style_id":                style_id,          # str ObjectId
+        "style_code":              style_code,        # denormalised for display
+        "online_status":           "draft",
+        "online_status_history":   [{
+            "status":     "draft",
+            "changed_at": now,
+            "by":         "system",
+            "notes":      "Auto-initialised on first read",
+        }],
+        "sale_channels":           [],
+        "mrp":                     None,
+        "online_selling_price":    None,
+        "platform_commission_pct": {},
+        "planned_min_stock":       25,
+        "planned_components":      [{"component": c, "planned_qty": 0} for c in PLANNED_COMPONENTS],
+        "planned_colors":          [],
+        "planned_sizes":           [],
+        "sole_mould_name":         "",
+        "sole_shape":              "",
+        "pattern_number":          "",
+        "photoshoot_link":         "",
+        "catalogue_link":          "",
+        "back_track_number":       "",
+        "went_live_at":            None,
+        "created_at":              now,
+        "updated_at":              now,
+    }
+
+
+async def _get_or_create_lifecycle(style_id: str) -> dict:
+    """Look up the lifecycle doc for a style. If missing, insert a default (draft) one."""
+    style = await db.styles.find_one({"_id": oid(style_id)})
+    if not style:
+        raise HTTPException(404, f"Style '{style_id}' not found")
+    doc = await db.style_lifecycle.find_one({"style_id": str(style["_id"])})
+    if doc:
+        return doc
+    doc = _default_lifecycle(str(style["_id"]), style["code"])
+    try:
+        res = await db.style_lifecycle.insert_one(doc)
+        doc["_id"] = res.inserted_id
+    except DuplicateKeyError:
+        doc = await db.style_lifecycle.find_one({"style_id": str(style["_id"])})
+    return doc
+
+
+async def _generate_back_track_number(style_code: str) -> str:
+    """Return '{style_code}-{YYYYMMDD}-{seq}' where seq is the next per-(code,date) counter."""
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    prefix = f"{style_code}-{today}-"
+    # Count existing back_track_numbers with this prefix on style_lifecycle
+    existing = await db.style_lifecycle.count_documents({
+        "back_track_number": {"$regex": f"^{re.escape(prefix)}"}
+    })
+    return f"{prefix}{existing + 1:03d}"
+
+
+async def _seed_fg_inventory_for_lifecycle(lifecycle_doc: dict, user_email: str) -> dict:
+    """Auto-create fg_inventory rows for every planned (color, size) pair, at
+    ready_stock_qty=0 and min_stock_level=planned_min_stock. Idempotent — if a row
+    already exists for a (style_id, color, size), only the min_stock_level is updated
+    (never overwrites existing quantities).
+
+    Returns a summary: {created, updated, pairs}
+    """
+    style_id  = lifecycle_doc["style_id"]
+    colors    = [c for c in (lifecycle_doc.get("planned_colors") or []) if c and str(c).strip()]
+    sizes     = [s for s in (lifecycle_doc.get("planned_sizes")  or []) if s and str(s).strip()]
+    min_stock = int(lifecycle_doc.get("planned_min_stock") or 25)
+
+    if not colors or not sizes:
+        return {"created": 0, "updated": 0, "pairs": 0,
+                "note": "No planned colors/sizes — nothing seeded"}
+
+    style = await db.styles.find_one({"_id": ObjectId(style_id)})
+    style_code = style["code"] if style else lifecycle_doc.get("style_code", "")
+
+    created = 0
+    updated = 0
+    now = now_iso()
+    for color in colors:
+        for size in sizes:
+            row = await db.fg_inventory.find_one({
+                "style_id": ObjectId(style_id),
+                "color":    color,
+                "size":     size,
+            })
+            if row:
+                # Only bump the min_stock_level; never touch quantities
+                await db.fg_inventory.update_one(
+                    {"_id": row["_id"]},
+                    {"$set": {"min_stock_level": min_stock, "updated_at": now}}
+                )
+                updated += 1
+            else:
+                try:
+                    await db.fg_inventory.insert_one({
+                        "style_id":         ObjectId(style_id),
+                        "style_code":       style_code,
+                        "color":            color,
+                        "size":             size,
+                        "ready_stock_qty":  0,
+                        "reserved_qty":     0,
+                        "in_transit_qty":   0,
+                        "return_qty":       0,
+                        "damaged_qty":      0,
+                        "liquidation_qty":  0,
+                        "min_stock_level":  min_stock,
+                        "updated_at":       now,
+                    })
+                    created += 1
+                except DuplicateKeyError:
+                    updated += 1
+
+    await log_activity(
+        "SEED", "style_lifecycle",
+        f"Seeded FG inventory for {style_code}: {created} created, {updated} updated ({len(colors)}x{len(sizes)} pairs)",
+        user_email,
+    )
+    return {"created": created, "updated": updated, "pairs": len(colors) * len(sizes)}
+
+
+def _validate_online_status_transition(current: str, to_status: str):
+    """Raises 400 if the transition is not allowed. Rules:
+       - Side-branches (archived, liquidation_candidate) are reachable from any state.
+       - Otherwise: strictly forward along ONLINE_STATUS_SEQUENCE (one step at a time),
+         and re-selecting the current status is a no-op (200).
+    """
+    if to_status not in (ONLINE_STATUS_SEQUENCE + list(ONLINE_STATUS_SIDE_BRANCHES)):
+        raise HTTPException(400, f"Unknown online_status '{to_status}'")
+    if to_status in ONLINE_STATUS_SIDE_BRANCHES:
+        return
+    if current == to_status:
+        return
+    # Both current and target must be in the main sequence to compare positions
+    if current in ONLINE_STATUS_SIDE_BRANCHES:
+        raise HTTPException(400,
+            f"Cannot transition from side-branch '{current}' back into the pipeline. "
+            f"Un-archive is not supported.")
+    try:
+        cur_idx = ONLINE_STATUS_SEQUENCE.index(current)
+        new_idx = ONLINE_STATUS_SEQUENCE.index(to_status)
+    except ValueError:
+        raise HTTPException(400, f"Invalid transition from '{current}' to '{to_status}'")
+    if new_idx != cur_idx + 1:
+        raise HTTPException(400,
+            f"Invalid transition: {current} → {to_status}. "
+            f"Only forward, one step at a time (next allowed: "
+            f"{ONLINE_STATUS_SEQUENCE[cur_idx + 1] if cur_idx + 1 < len(ONLINE_STATUS_SEQUENCE) else '—'}).")
+
+
+@api.get("/style-lifecycle/{style_id}")
+async def get_style_lifecycle(style_id: str, request: Request):
+    """Return the lifecycle doc for a style. Auto-creates a 'draft' doc if none exists yet."""
+    await get_current_user(request)
+    doc = await _get_or_create_lifecycle(style_id)
+    return stringify(doc)
+
+
+@api.put("/style-lifecycle/{style_id}")
+async def upsert_style_lifecycle(style_id: str, payload: StyleLifecycleUpsert, request: Request):
+    """Upsert lifecycle fields (mrp, sale_channels, planned_*, sole info, links, etc.).
+    This endpoint does NOT change online_status — use PATCH /styles/{sid}/online-status for that.
+    """
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    existing = await _get_or_create_lifecycle(style_id)
+    update: dict = {"updated_at": now_iso()}
+    payload_dict = payload.model_dump(exclude_none=True)
+
+    # planned_components: normalize list of pydantic objs to plain dicts
+    if "planned_components" in payload_dict:
+        pcs = payload_dict["planned_components"]
+        # Enforce the canonical component set — merge any missing components at qty=0
+        by_name = {c["component"]: int(c.get("planned_qty") or 0) for c in pcs}
+        payload_dict["planned_components"] = [
+            {"component": name, "planned_qty": by_name.get(name, 0)}
+            for name in PLANNED_COMPONENTS
+        ]
+
+    for k, v in payload_dict.items():
+        update[k] = v
+
+    await db.style_lifecycle.update_one({"style_id": str(existing.get("style_id"))}, {"$set": update})
+    await log_activity(
+        "UPDATE", "style_lifecycle",
+        f"Updated lifecycle for {existing.get('style_code')}: {', '.join(payload_dict.keys())}",
+        u["email"],
+    )
+    return stringify(await db.style_lifecycle.find_one({"style_id": str(existing.get("style_id"))}))
+
+
+@api.patch("/styles/{sid}/online-status")
+async def patch_style_online_status(sid: str, payload: OnlineStatusPatchIn, request: Request):
+    """Advance a style's online lifecycle status.
+
+    Rules:
+      • Forward-only along the main pipeline sequence (one step at a time).
+      • 'archived' and 'liquidation_candidate' can be set from ANY state.
+      • On the FIRST transition to 'live':
+          - generate back_track_number = '{style_code}-{YYYYMMDD}-{seq}'
+          - set went_live_at = now
+          - auto-seed fg_inventory rows for each planned (color, size) at
+            ready_stock_qty=0 and min_stock_level=planned_min_stock.
+
+    Returns the updated lifecycle doc plus a `seed_result` summary when live-seeding fired.
+    """
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    lifecycle = await _get_or_create_lifecycle(sid)
+
+    current = lifecycle.get("online_status", "draft")
+    to_status = payload.to_status
+    _validate_online_status_transition(current, to_status)
+
+    now = now_iso()
+    history_entry = {
+        "status":     to_status,
+        "changed_at": now,
+        "by":         u["email"],
+        "notes":      (payload.notes or "").strip(),
+        "from":       current,
+    }
+    update = {
+        "$set":  {"online_status": to_status, "updated_at": now},
+        "$push": {"online_status_history": history_entry},
+    }
+
+    seed_result = None
+    # First-time-live side effects
+    if to_status == "live" and current != "live":
+        style = await db.styles.find_one({"_id": oid(sid)})
+        style_code = style["code"] if style else lifecycle.get("style_code", "")
+        # Only generate a new back_track_number if the style doesn't already have one
+        if not lifecycle.get("back_track_number"):
+            back_track = await _generate_back_track_number(style_code)
+            update["$set"]["back_track_number"] = back_track
+        # Always set / refresh went_live_at on the transition INTO live
+        update["$set"]["went_live_at"] = now
+
+    await db.style_lifecycle.update_one({"style_id": str(lifecycle["style_id"])}, update)
+    updated_doc = await db.style_lifecycle.find_one({"style_id": str(lifecycle["style_id"])})
+
+    # Now seed FG inventory (after the doc is updated so seed uses the latest planned_*)
+    if to_status == "live" and current != "live":
+        seed_result = await _seed_fg_inventory_for_lifecycle(updated_doc, u["email"])
+
+    await log_activity(
+        "STATUS", "style_lifecycle",
+        f"{updated_doc.get('style_code')}: {current} → {to_status}"
+        + (f" [seeded: {seed_result['created']} FG rows]" if seed_result else ""),
+        u["email"],
+    )
+    resp = stringify(updated_doc)
+    if seed_result:
+        resp["seed_result"] = seed_result
+    return resp
+
+
+@api.get("/styles/online")
+async def list_online_styles(
+    request: Request,
+    online_status:  Optional[str] = None,
+    sale_channel:   Optional[str] = None,
+    search:         Optional[str] = None,
+):
+    """Return the online pipeline: every style that has (or should have) a lifecycle doc.
+    For any style without an existing lifecycle doc, a default 'draft' doc is materialised
+    on the fly so the pipeline is complete.
+
+    Response items include: style_id, style_code, style_name, image_url, online_status,
+    online_status_history, sale_channels, mrp, online_selling_price, planned_colors,
+    planned_sizes, planned_components, back_track_number, went_live_at, and the list of
+    channel SKU mappings for the style (from sku_map) for display.
+    """
+    await get_current_user(request)
+
+    # Base style filter
+    style_query: dict = {}
+    if search:
+        rx = {"$regex": re.escape(search), "$options": "i"}
+        style_query["$or"] = [{"code": rx}, {"name": rx}]
+
+    styles = await db.styles.find(style_query).sort("code", 1).to_list(5000)
+    style_ids_str = [str(s["_id"]) for s in styles]
+
+    # Fetch all existing lifecycles for these styles
+    lifecycles = await db.style_lifecycle.find({"style_id": {"$in": style_ids_str}}).to_list(5000)
+    lc_by_id = {l["style_id"]: l for l in lifecycles}
+
+    # Fetch all sku_map rows for these styles (denormalised into the response for display)
+    mappings = await db.sku_map.find({"style_id": {"$in": style_ids_str}}).to_list(20000)
+    maps_by_style: dict = {}
+    for m in mappings:
+        maps_by_style.setdefault(m["style_id"], []).append({
+            "id":                  str(m["_id"]),
+            "source_type":         m.get("source_type"),
+            "source_name":         m.get("source_name"),
+            "external_sku":        m.get("external_sku"),
+            "external_style_name": m.get("external_style_name", ""),
+        })
+
+    out = []
+    for s in styles:
+        sid = str(s["_id"])
+        lc = lc_by_id.get(sid) or _default_lifecycle(sid, s["code"])
+        # Apply filters on the lifecycle side
+        if online_status and lc.get("online_status") != online_status:
+            continue
+        if sale_channel and sale_channel not in (lc.get("sale_channels") or []):
+            continue
+
+        out.append({
+            "style_id":               sid,
+            "style_code":             s.get("code"),
+            "style_name":             s.get("name", ""),
+            "image_url":              s.get("image_url", ""),
+            "online_status":          lc.get("online_status", "draft"),
+            "online_status_history":  lc.get("online_status_history", []),
+            "sale_channels":          lc.get("sale_channels", []),
+            "mrp":                    lc.get("mrp"),
+            "online_selling_price":   lc.get("online_selling_price"),
+            "platform_commission_pct": lc.get("platform_commission_pct", {}),
+            "planned_min_stock":      lc.get("planned_min_stock", 25),
+            "planned_components":     lc.get("planned_components", []),
+            "planned_colors":         lc.get("planned_colors", []),
+            "planned_sizes":          lc.get("planned_sizes", []),
+            "sole_mould_name":        lc.get("sole_mould_name", ""),
+            "sole_shape":             lc.get("sole_shape", ""),
+            "pattern_number":         lc.get("pattern_number", ""),
+            "photoshoot_link":        lc.get("photoshoot_link", ""),
+            "catalogue_link":         lc.get("catalogue_link", ""),
+            "back_track_number":      lc.get("back_track_number", ""),
+            "went_live_at":           lc.get("went_live_at"),
+            "channel_skus":           maps_by_style.get(sid, []),
+        })
+
+    # Order by pipeline position, then by code
+    def sort_key(row):
+        st = row["online_status"]
+        try:
+            idx = ONLINE_STATUS_SEQUENCE.index(st)
+        except ValueError:
+            idx = 99 if st == "archived" else 98      # archived last, liquidation just before
+        return (idx, row["style_code"] or "")
+    out.sort(key=sort_key)
+    return out
 
 
 # ---------- FINISHED GOODS INVENTORY & RESERVATION ENGINE ----------
@@ -5651,6 +6054,13 @@ async def on_startup():
         await db.sku_map.create_index("style_id", name="sku_map_style_id")
     except Exception as e:
         log.warning(f"Could not create sku_map indexes: {e}")
+
+    # Style lifecycle: unique per style_id + status index for fast pipeline filtering
+    try:
+        await db.style_lifecycle.create_index("style_id", unique=True, name="style_lifecycle_unique")
+        await db.style_lifecycle.create_index("online_status", name="style_lifecycle_status")
+    except Exception as e:
+        log.warning(f"Could not create style_lifecycle indexes: {e}")
 
     # fg_inventory unique index
     try:

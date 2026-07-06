@@ -39,7 +39,8 @@ const navGroups = [
     title: "Online Commerce",
     workspaces: ["online", "management"],
     items: [
-      { to: "/sku-map", label: "Online Style Pipeline", icon: ArrowLeftRight, roles: ["admin", "manager"] },
+      { to: "/online-pipeline", label: "Online Style Pipeline", icon: Layers, roles: ["admin", "manager"] },
+      { to: "/sku-map", label: "SKU Mapping", icon: ArrowLeftRight, roles: ["admin", "manager"] },
       { to: "/ready-stock", label: "Ready Stock", icon: Boxes, roles: ["admin", "manager"] },
       { to: "/online-orders", label: "Online Orders", icon: ShoppingBag, roles: ["admin", "manager", "sales"] },
       { to: "/dispatch", label: "Dispatch", icon: Truck, roles: ["admin", "manager", "production"] },

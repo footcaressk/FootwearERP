@@ -21,6 +21,7 @@ import Clients from "@/pages/Clients";
 import Vendors from "@/pages/Vendors";
 import VendorPOs from "@/pages/VendorPOs";
 import SkuMap from "@/pages/SkuMap";
+import OnlineStylePipeline from "@/pages/OnlineStylePipeline";
 import OnlineOrders from "@/pages/OnlineOrders";
 import ReadyStock from "@/pages/ReadyStock";
 import SelectWorkspace from "@/pages/SelectWorkspace";
@@ -71,6 +72,7 @@ function App() {
             <Route path="vendors" element={<Vendors />} />
             <Route path="vendor-pos" element={<VendorPOs />} />
             <Route path="sku-map" element={<SkuMap />} />
+            <Route path="online-pipeline" element={<OnlineStylePipeline />} />
             <Route path="ready-stock" element={<ReadyStock />} />
             <Route path="online-orders" element={<OnlineOrders />} />
             <Route path="settings" element={<Settings />} />
