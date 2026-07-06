@@ -800,6 +800,42 @@ class PicklistPatchIn(BaseModel):
     status: Optional[Literal["pending", "in_progress", "completed", "cancelled"]] = None
 
 
+# ----- Marketplace SKU Resolver -----
+Marketplace = Literal["myntra", "ajio", "flipkart", "nykaa", "amazon", "website", "unicommerce"]
+
+
+class ParserTemplateIn(BaseModel):
+    marketplace: Marketplace
+    template:    str  # human-readable description, e.g. "STYLE-COLOR-SIZE"
+    pattern:     str  # regex with named groups (?P<style>...)(?P<color>...)(?P<size>...)
+    separator:   Optional[str] = None
+    active:      bool = True
+    example:     Optional[str] = None
+
+
+class StyleColorMappingIn(BaseModel):
+    marketplace:            Marketplace
+    marketplace_style_code: str
+    marketplace_color_code: str
+    erp_style_code:         str
+    erp_color_code:         str
+    active:                 bool = True
+
+
+class SkuResolveIn(BaseModel):
+    marketplace: Marketplace
+    sku:         str
+
+
+class UnresolvedMapIn(BaseModel):
+    queue_id:               Optional[str] = None
+    marketplace:            Marketplace
+    marketplace_style_code: str
+    marketplace_color_code: str
+    erp_style_code:         str
+    erp_color_code:         str
+
+
 # Sensible factory defaults (in hours)
 DEFAULT_STAGE_HOURS = {
     "procurement": 24, "cutting": 24, "folding": 8, "attachment": 8,
@@ -5148,8 +5184,8 @@ async def import_online_orders(
     u = await get_current_user(request); require_roles("admin", "manager")(u)
 
     channel = channel.strip().lower()
-    if channel not in ["myntra", "flipkart", "nykaa", "website"]:
-        raise HTTPException(400, f"Unknown channel '{channel}'. Must be: myntra, flipkart, nykaa, website")
+    if channel not in ["myntra", "ajio", "flipkart", "nykaa", "amazon", "website", "unicommerce"]:
+        raise HTTPException(400, f"Unknown channel '{channel}'. Must be one of: myntra, ajio, flipkart, nykaa, amazon, website, unicommerce")
 
     today = (order_date or now_iso()[:10])
 
@@ -5207,32 +5243,68 @@ async def import_online_orders(
         delivery_date = row.get("delivery_date", "")
         description   = row.get("description", "")
 
-        # ── resolve_style: online_channel pass ──────────────────────────────
-        result = await resolve_style(
-            source_type="online_channel",
-            source_name=channel,
-            external_sku=style_sku,
-            external_color=ext_color or None,
-            external_size=ext_size  or None,
-        )
+        # ── Marketplace SKU Resolver (Phase 1) ──────────────────────────────
+        # Try to parse+resolve using the marketplace resolver first. This handles the
+        # case where the marketplace SKU embeds style+color+size (e.g. "CC-058-BR-38").
+        # If it fails, fall back to the legacy sku_map/style_code resolver below.
+        mp_result = await _resolve_marketplace_sku(channel, style_sku)
+        result = None
+        if mp_result.get("resolved"):
+            # Marketplace resolver hit — override the ext_color/ext_size with parsed values
+            result = {
+                "style_id":        mp_result["erp_style_id"],
+                "style_code":      mp_result["erp_style_code"],
+                "color":           mp_result["erp_color_code"],
+                "size":            mp_result["parsed_size"] or ext_size,
+                "matched":         True,
+                "match_via":       "marketplace_resolver",
+                "mapping_id":      mp_result["mapping_id"],
+                "mapped_from_sku": style_sku,
+            }
 
-        if not result["matched"]:
+        if result is None:
+            # ── Legacy fallback: sku_map or exact styles.code match ─────────────
+            legacy = await resolve_style(
+                source_type="online_channel",
+                source_name=channel,
+                external_sku=style_sku,
+                external_color=ext_color or mp_result.get("parsed_color") or None,
+                external_size=ext_size  or mp_result.get("parsed_size")  or None,
+            )
+            if legacy["matched"]:
+                result = legacy
+
+        if not result:
+            # Neither resolver nor legacy could match — log to unresolved queue
             unresolved += 1
+            try:
+                await _log_unresolved_sku(channel, style_sku, mp_result,
+                                           source="online_orders_import", order_id=order_id)
+            except Exception:
+                pass
             errors.append({
                 "row":       idx,
                 "order_id":  order_id,
                 "style_sku": style_sku,
-                "reason":    f"No sku_map entry and no styles.code match for '{style_sku}' on channel '{channel}'. "
-                             f"Add a mapping at /sku-map before re-importing.",
+                "reason":    f"Unresolved SKU on channel '{channel}'. "
+                             + (f"Parsed as style={mp_result.get('parsed_style')}/color={mp_result.get('parsed_color')}/size={mp_result.get('parsed_size')} but no ERP mapping. " if mp_result.get('parsed_ok') else f"SKU parse failed. ")
+                             + f"Map it via SKU Resolver → Unresolved Queue.",
+                "parsed":    {
+                    "style": mp_result.get("parsed_style"),
+                    "color": mp_result.get("parsed_color"),
+                    "size":  mp_result.get("parsed_size"),
+                },
             })
             continue
 
         entered  = now_iso()
         deadline = _compute_deadline(entered, durations.get("procurement", 24))
 
-        match_status = result["match_via"]   # "sku_map" or "style_code"
+        match_status = result["match_via"]   # "sku_map" | "style_code" | "marketplace_resolver"
         if match_status == "sku_map":
             match_status = "mapped"
+        elif match_status == "marketplace_resolver":
+            match_status = "resolved"
         else:
             match_status = "matched"
 
@@ -5288,7 +5360,7 @@ async def import_online_orders(
             "style_code":         result["style_code"],
             "style_id":           result["style_id"],
             "style_match_status": match_status,
-            **({"mapped_from_sku": result["mapped_from_sku"], "sku_mapping_id": result["mapping_id"]} if result["match_via"] == "sku_map" else {}),
+            **({"mapped_from_sku": result["mapped_from_sku"], "sku_mapping_id": result["mapping_id"]} if result["match_via"] in ("sku_map", "marketplace_resolver") else {}),
 
             # Line details
             "description":        description,
@@ -6709,12 +6781,56 @@ def _recompute_status(occupied: int, capacity: int) -> str:
 
 
 async def _allocate_to_locations(style_id, style_code, color, size, qty, user_email,
-                                  reference_type="", reference_id="", zone="main"):
+                                  reference_type="", reference_id="", zone="main",
+                                  prefer_existing_sku_cells=False):
     """Sequentially fill cells (by location_code ASC) until qty placed.
-    zone: 'main' (default) or 'return_holding'."""
+    zone: 'main' (default) or 'return_holding'.
+    prefer_existing_sku_cells: when True (used for return_restocked), first fill any
+       existing cells that already hold this SKU (with room to spare) before opening
+       a fresh empty cell. This keeps the SKU consolidated at its original location(s).
+    """
     remaining = int(qty)
     placements = []
     guard = 0
+
+    # Phase A — same-SKU consolidation (only when prefer_existing_sku_cells is True)
+    if prefer_existing_sku_cells and remaining > 0:
+        existing_cur = db.fg_location_inventory.find({
+            "style_id": ObjectId(style_id), "color": color, "size": size,
+        }).sort([("created_at", 1), ("location_code", 1)])
+        async for inv in existing_cur:
+            if remaining <= 0:
+                break
+            code = inv.get("location_code")
+            # Only consolidate onto main-zone, non-blocked cells with room
+            wloc = await db.warehouse_locations.find_one({
+                "location_code": code, "zone": zone,
+                "status": {"$ne": "blocked"}, "available_pairs": {"$gt": 0},
+            })
+            if not wloc:
+                continue
+            place_qty = min(remaining, int(wloc["available_pairs"]))
+            new_occupied  = int(wloc["occupied_pairs"]) + place_qty
+            new_available = int(wloc["available_pairs"]) - place_qty
+            new_status    = _recompute_status(new_occupied, int(wloc["capacity_pairs"]))
+            res = await db.warehouse_locations.update_one(
+                {"_id": wloc["_id"], "available_pairs": wloc["available_pairs"]},
+                {"$set": {"occupied_pairs": new_occupied, "available_pairs": new_available,
+                          "status": new_status, "updated_at": now_iso()}},
+            )
+            if res.modified_count == 0:
+                continue
+            await db.fg_location_inventory.update_one(
+                {"_id": inv["_id"]},
+                {"$inc": {"qty": place_qty},
+                 "$set": {"style_code": style_code, "updated_at": now_iso()}},
+            )
+            placements.append({"location_code": code, "qty": place_qty,
+                                "rack": wloc["rack"], "row": wloc["row"], "column": wloc["column"],
+                                "zone": zone, "consolidated": True})
+            remaining -= place_qty
+
+    # Phase B — sequential fill from first empty/partial cell in zone
     while remaining > 0 and guard < 500:
         guard += 1
         loc = await db.warehouse_locations.find_one(
@@ -6757,16 +6873,25 @@ async def _allocate_to_locations(style_id, style_code, color, size, qty, user_em
 
 
 async def _deduct_from_locations(style_id, color, size, qty, user_email,
-                                  reference_type="", reference_id=""):
-    """FIFO deduction: oldest fg_location_inventory doc first (by created_at, then location_code)."""
+                                  reference_type="", reference_id="", zone=None):
+    """FIFO deduction: oldest fg_location_inventory doc first (by created_at, then location_code).
+    Optionally restrict to a specific zone ('main' | 'return_holding')."""
     remaining = int(qty)
     removals = []
     guard = 0
+    # Precompute the set of location_codes in target zone if a filter is requested
+    allowed_codes = None
+    if zone:
+        allowed_codes = set()
+        async for w in db.warehouse_locations.find({"zone": zone}, {"location_code": 1}):
+            allowed_codes.add(w["location_code"])
     while remaining > 0 and guard < 500:
         guard += 1
+        q = {"style_id": ObjectId(style_id), "color": color, "size": size, "qty": {"$gt": 0}}
+        if allowed_codes is not None:
+            q["location_code"] = {"$in": list(allowed_codes)}
         loc_inv = await db.fg_location_inventory.find_one(
-            {"style_id": ObjectId(style_id), "color": color, "size": size, "qty": {"$gt": 0}},
-            sort=[("created_at", 1), ("location_code", 1)],
+            q, sort=[("created_at", 1), ("location_code", 1)],
         )
         if not loc_inv:
             break
@@ -6849,16 +6974,18 @@ async def _sync_warehouse_locations(payload, user_email):
             return await _allocate_to_locations(style_id, style_code, color, size, qty,
                                                  user_email, ref, ref_id, zone="main")
     elif mt == "return_restocked":
-        # Returns cleared inspection — put back into main zone
+        # Returns cleared inspection — put back into main zone, preferring cells that
+        # already hold this SKU so the pairs consolidate at their original location.
         if qty > 0:
-            # Also try to remove from return_holding zone (best-effort)
+            # Deduct from return_holding zone first (best-effort)
             try:
                 await _deduct_from_locations(style_id, color, size, qty,
                                               user_email, ref, ref_id)
             except Exception:
                 pass
             return await _allocate_to_locations(style_id, style_code, color, size, qty,
-                                                 user_email, ref, ref_id, zone="main")
+                                                 user_email, ref, ref_id, zone="main",
+                                                 prefer_existing_sku_cells=True)
     elif mt == "return_in":
         # Fresh return — quarantine in return_holding zone
         if qty > 0:
@@ -7507,6 +7634,399 @@ async def pending_product_list(request: Request):
     return out
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# ══ MARKETPLACE SKU RESOLVER ENGINE ════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Goal: The ERP stores Style + Color matrix + Size matrix only (NO exploded
+# per-size SKUs). Marketplaces embed style+color+size in a single string
+# like "CC-058-BR-38" or "FL_AK_002_GO-4". We parse them with a per-market
+# regex template, then resolve marketplace style/color codes to ERP style/
+# color codes via a mapping table. Size is taken verbatim from the parsed SKU.
+# ═══════════════════════════════════════════════════════════════════════
+
+SUPPORTED_MARKETPLACES = ["myntra", "ajio", "flipkart", "nykaa", "amazon", "website", "unicommerce"]
+
+# Default regex patterns — greedy style + last two segments are color and size.
+# Users can override via /api/marketplace/parser-templates.
+DEFAULT_PARSER_PATTERNS = {
+    # Myntra: CC-058-BR-38 → style=CC-058, color=BR, size=38
+    "myntra":      r"^(?P<style>.+?)[-_](?P<color>[A-Za-z]{1,4})[-_](?P<size>[0-9]{1,4}(?:\.[0-9]{1,2})?)$",
+    # Ajio: similar
+    "ajio":        r"^(?P<style>.+?)[-_](?P<color>[A-Za-z]{1,4})[-_](?P<size>[0-9]{1,4}(?:\.[0-9]{1,2})?)$",
+    # Flipkart: FL_AK_002_GO-4 → style=FL_AK_002, color=GO, size=4
+    "flipkart":    r"^(?P<style>.+?)[_-](?P<color>[A-Za-z]{1,4})[_-](?P<size>[0-9]{1,4}(?:\.[0-9]{1,2})?)$",
+    # Nykaa
+    "nykaa":       r"^(?P<style>.+?)[-_](?P<color>[A-Za-z]{1,4})[-_](?P<size>[0-9]{1,4}(?:\.[0-9]{1,2})?)$",
+    # Amazon (ASIN-style is opaque; assume merchant SKU pattern with style-color-size)
+    "amazon":      r"^(?P<style>.+?)[-_](?P<color>[A-Za-z]{1,4})[-_](?P<size>[0-9]{1,4}(?:\.[0-9]{1,2})?)$",
+    # Own website
+    "website":     r"^(?P<style>.+?)[-_](?P<color>[A-Za-z]{1,4})[-_](?P<size>[0-9]{1,4}(?:\.[0-9]{1,2})?)$",
+    # Unicommerce middleware
+    "unicommerce": r"^(?P<style>.+?)[-_](?P<color>[A-Za-z]{1,4})[-_](?P<size>[0-9]{1,4}(?:\.[0-9]{1,2})?)$",
+}
+
+
+async def _seed_parser_templates():
+    """Idempotently seed default parser templates for all supported marketplaces."""
+    inserted = 0
+    for mp in SUPPORTED_MARKETPLACES:
+        exists = await db.sku_parser_templates.find_one({"marketplace": mp})
+        if not exists:
+            await db.sku_parser_templates.insert_one({
+                "marketplace":  mp,
+                "template":     "STYLE-COLOR-SIZE",
+                "pattern":      DEFAULT_PARSER_PATTERNS[mp],
+                "separator":    "-" if mp not in ("flipkart",) else "_",
+                "active":       True,
+                "example":      {"myntra": "CC-058-BR-38", "flipkart": "FL_AK_002_GO-4"}.get(mp, "STYLE-COLOR-SIZE"),
+                "created_at":   now_iso(),
+                "updated_at":   now_iso(),
+            })
+            inserted += 1
+    return inserted
+
+
+async def _get_parser_template(marketplace: str):
+    """Return the active parser template for a marketplace, or a fallback default."""
+    tmpl = await db.sku_parser_templates.find_one({"marketplace": marketplace, "active": True})
+    if tmpl:
+        return tmpl
+    return {
+        "marketplace": marketplace,
+        "pattern":     DEFAULT_PARSER_PATTERNS.get(marketplace, DEFAULT_PARSER_PATTERNS["myntra"]),
+        "template":    "STYLE-COLOR-SIZE (default)",
+    }
+
+
+def _parse_sku(sku: str, pattern: str):
+    """Parse a raw marketplace SKU using a regex with named groups.
+    Returns {ok, style, color, size, error}."""
+    if not sku:
+        return {"ok": False, "error": "empty sku"}
+    try:
+        m = re.match(pattern, sku.strip())
+    except re.error as e:
+        return {"ok": False, "error": f"bad regex: {e}"}
+    if not m:
+        return {"ok": False, "error": f"pattern did not match: {pattern}"}
+    d = m.groupdict()
+    style = (d.get("style") or "").strip()
+    color = (d.get("color") or "").strip()
+    size  = (d.get("size")  or "").strip()
+    if not (style and color and size):
+        return {"ok": False, "error": "missing style/color/size group"}
+    return {"ok": True, "style": style, "color": color, "size": size}
+
+
+async def _resolve_marketplace_sku(marketplace: str, sku: str):
+    """Full resolver: parse marketplace SKU → resolve to ERP style+color → verify size.
+    Does NOT modify data. Used by /parse-sku, /online-orders/import and the SKU Resolver
+    screen. Returns a rich dict with all intermediate values for audit/UI."""
+    tmpl = await _get_parser_template(marketplace)
+    parsed = _parse_sku(sku, tmpl["pattern"])
+    out = {
+        "marketplace":     marketplace,
+        "raw_sku":         sku,
+        "template":        tmpl.get("template"),
+        "pattern":         tmpl.get("pattern"),
+        "parsed_ok":       parsed["ok"],
+        "parsed_style":    parsed.get("style"),
+        "parsed_color":    parsed.get("color"),
+        "parsed_size":     parsed.get("size"),
+        "parse_error":     parsed.get("error"),
+        "erp_style_id":    None,
+        "erp_style_code":  None,
+        "erp_color_code":  None,
+        "erp_size":        parsed.get("size"),
+        "mapping_id":      None,
+        "resolved":        False,
+        "resolution_status": "parse_failed" if not parsed["ok"] else "unmapped",
+    }
+    if not parsed["ok"]:
+        return out
+
+    # Lookup marketplace_style_color_mapping (case-insensitive)
+    mapping = await db.marketplace_style_color_mapping.find_one({
+        "marketplace":            marketplace,
+        "marketplace_style_code": {"$regex": f"^{re.escape(parsed['style'])}$", "$options": "i"},
+        "marketplace_color_code": {"$regex": f"^{re.escape(parsed['color'])}$", "$options": "i"},
+        "active":                 {"$ne": False},
+    })
+    if not mapping:
+        out["resolution_status"] = "unmapped"
+        return out
+
+    # Lookup ERP style by code
+    style = await db.styles.find_one({
+        "code": {"$regex": f"^{re.escape(mapping['erp_style_code'])}$", "$options": "i"},
+    })
+    if not style:
+        out["resolution_status"] = "erp_style_missing"
+        out["erp_style_code"] = mapping["erp_style_code"]
+        out["erp_color_code"] = mapping["erp_color_code"]
+        return out
+
+    out["erp_style_id"]   = str(style["_id"])
+    out["erp_style_code"] = style["code"]
+    out["erp_color_code"] = mapping["erp_color_code"]
+    out["mapping_id"]     = str(mapping["_id"])
+    out["resolved"]       = True
+    out["resolution_status"] = "resolved"
+    return out
+
+
+async def _log_unresolved_sku(marketplace: str, raw_sku: str, resolution: dict,
+                               source: str = "import", order_id: Optional[str] = None):
+    """Add or upsert an entry to the unresolved SKU queue for later manual mapping."""
+    key = {
+        "marketplace":            marketplace,
+        "raw_sku":                raw_sku,
+        "marketplace_style_code": resolution.get("parsed_style"),
+        "marketplace_color_code": resolution.get("parsed_color"),
+    }
+    now = now_iso()
+    upd = {
+        "$set": {
+            **key,
+            "parsed_size":         resolution.get("parsed_size"),
+            "resolution_status":   resolution.get("resolution_status"),
+            "parse_error":         resolution.get("parse_error"),
+            "last_source":         source,
+            "last_seen_at":        now,
+        },
+        "$setOnInsert": {"created_at": now, "occurrences": 0, "status": "open"},
+        "$inc":         {"occurrences": 1},
+    }
+    if order_id:
+        upd["$addToSet"] = {"seen_order_ids": order_id}
+    await db.unresolved_sku_queue.update_one(key, upd, upsert=True)
+
+
+# ───────────── Parser Templates endpoints ─────────────
+
+@api.get("/marketplace/parser-templates")
+async def list_parser_templates(request: Request):
+    await get_current_user(request)
+    docs = await db.sku_parser_templates.find({}).sort("marketplace", 1).to_list(50)
+    return [stringify(d) for d in docs]
+
+
+@api.post("/marketplace/parser-templates")
+async def upsert_parser_template(request: Request, payload: ParserTemplateIn):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    # Validate regex compiles and produces the three named groups
+    try:
+        cp = re.compile(payload.pattern)
+    except re.error as e:
+        raise HTTPException(400, f"Invalid regex: {e}")
+    if not all(g in cp.groupindex for g in ("style", "color", "size")):
+        raise HTTPException(400, "Pattern must contain named groups (?P<style>), (?P<color>), (?P<size>)")
+    now = now_iso()
+    doc = {
+        "marketplace": payload.marketplace,
+        "template":    payload.template,
+        "pattern":     payload.pattern,
+        "separator":   payload.separator,
+        "active":      payload.active,
+        "example":     payload.example,
+        "updated_at":  now,
+    }
+    await db.sku_parser_templates.update_one(
+        {"marketplace": payload.marketplace},
+        {"$set": doc, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    ret = await db.sku_parser_templates.find_one({"marketplace": payload.marketplace})
+    await log_activity("UPDATE", "sku_parser_templates", f"Set parser for {payload.marketplace}", u["email"])
+    return stringify(ret)
+
+
+@api.delete("/marketplace/parser-templates/{tid}")
+async def delete_parser_template(request: Request, tid: str):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    try:
+        await db.sku_parser_templates.delete_one({"_id": ObjectId(tid)})
+    except Exception:
+        raise HTTPException(404, "Template not found")
+    return {"ok": True}
+
+
+# ───────────── Style-Color Mapping endpoints ─────────────
+
+@api.get("/marketplace/style-color-mapping")
+async def list_marketplace_mappings(
+    request: Request,
+    marketplace: Optional[str] = None,
+    search:      Optional[str] = None,
+    active:      Optional[bool] = None,
+):
+    await get_current_user(request)
+    q = {}
+    if marketplace: q["marketplace"] = marketplace
+    if active is not None: q["active"] = active
+    if search:
+        q["$or"] = [
+            {"marketplace_style_code": {"$regex": search, "$options": "i"}},
+            {"marketplace_color_code": {"$regex": search, "$options": "i"}},
+            {"erp_style_code":         {"$regex": search, "$options": "i"}},
+            {"erp_color_code":         {"$regex": search, "$options": "i"}},
+        ]
+    docs = await db.marketplace_style_color_mapping.find(q).sort("marketplace", 1).to_list(2000)
+    return [stringify(d) for d in docs]
+
+
+@api.post("/marketplace/style-color-mapping")
+async def upsert_marketplace_mapping(request: Request, payload: StyleColorMappingIn):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    # Validate ERP style exists
+    style = await db.styles.find_one({
+        "code": {"$regex": f"^{re.escape(payload.erp_style_code)}$", "$options": "i"},
+    })
+    if not style:
+        raise HTTPException(400, f"ERP style '{payload.erp_style_code}' not found. Create it first.")
+
+    key = {
+        "marketplace":            payload.marketplace,
+        "marketplace_style_code": payload.marketplace_style_code,
+        "marketplace_color_code": payload.marketplace_color_code,
+    }
+    now = now_iso()
+    doc = {
+        **key,
+        "erp_style_code": style["code"],
+        "erp_style_id":   str(style["_id"]),
+        "erp_color_code": payload.erp_color_code,
+        "active":         payload.active,
+        "updated_at":     now,
+        "updated_by":     u["email"],
+    }
+    await db.marketplace_style_color_mapping.update_one(
+        key, {"$set": doc, "$setOnInsert": {"created_at": now}}, upsert=True,
+    )
+    ret = await db.marketplace_style_color_mapping.find_one(key)
+    await log_activity("UPDATE", "marketplace_style_color_mapping",
+                        f"{payload.marketplace}: {payload.marketplace_style_code}/{payload.marketplace_color_code} → {style['code']}/{payload.erp_color_code}",
+                        u["email"])
+    return stringify(ret)
+
+
+@api.delete("/marketplace/style-color-mapping/{mid}")
+async def delete_marketplace_mapping(request: Request, mid: str):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    try:
+        res = await db.marketplace_style_color_mapping.delete_one({"_id": ObjectId(mid)})
+    except Exception:
+        raise HTTPException(404, "Mapping not found")
+    if not res.deleted_count:
+        raise HTTPException(404, "Mapping not found")
+    return {"ok": True}
+
+
+# ───────────── Parse / Resolve endpoints ─────────────
+
+@api.post("/marketplace/parse-sku")
+async def parse_sku_endpoint(request: Request, payload: SkuResolveIn):
+    """One-shot SKU resolver — used by the SKU Resolver screen for manual testing."""
+    await get_current_user(request)
+    result = await _resolve_marketplace_sku(payload.marketplace, payload.sku)
+    return result
+
+
+@api.post("/marketplace/parse-batch")
+async def parse_sku_batch(request: Request, payload: dict):
+    """Batch resolve — payload: {marketplace, skus: [str]}"""
+    await get_current_user(request)
+    marketplace = payload.get("marketplace")
+    skus = payload.get("skus") or []
+    if not marketplace or not isinstance(skus, list):
+        raise HTTPException(400, "Provide {marketplace, skus: [str]}")
+    out = []
+    for sku in skus[:1000]:
+        out.append(await _resolve_marketplace_sku(marketplace, sku))
+    return {"count": len(out), "results": out}
+
+
+# ───────────── Unresolved SKU Queue ─────────────
+
+@api.get("/marketplace/unresolved")
+async def list_unresolved(
+    request: Request,
+    marketplace: Optional[str] = None,
+    status: Optional[str] = None,
+):
+    await get_current_user(request)
+    q = {}
+    if marketplace: q["marketplace"] = marketplace
+    q["status"] = status or "open"
+    docs = await db.unresolved_sku_queue.find(q).sort([("occurrences", -1), ("last_seen_at", -1)]).to_list(1000)
+    return [stringify(d) for d in docs]
+
+
+@api.post("/marketplace/unresolved/map")
+async def map_and_replay_unresolved(request: Request, payload: UnresolvedMapIn):
+    """Add a mapping and mark all matching unresolved queue entries as resolved.
+    System 'remembers' by inserting into marketplace_style_color_mapping and
+    flipping every open queue row that matches the marketplace_style/color keys."""
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+
+    # Insert (or upsert) the mapping
+    style = await db.styles.find_one({
+        "code": {"$regex": f"^{re.escape(payload.erp_style_code)}$", "$options": "i"},
+    })
+    if not style:
+        raise HTTPException(400, f"ERP style '{payload.erp_style_code}' not found. Create it first.")
+
+    key = {
+        "marketplace":            payload.marketplace,
+        "marketplace_style_code": payload.marketplace_style_code,
+        "marketplace_color_code": payload.marketplace_color_code,
+    }
+    now = now_iso()
+    await db.marketplace_style_color_mapping.update_one(
+        key,
+        {"$set": {
+            **key,
+            "erp_style_code": style["code"],
+            "erp_style_id":   str(style["_id"]),
+            "erp_color_code": payload.erp_color_code,
+            "active":         True,
+            "updated_at":     now,
+            "updated_by":     u["email"],
+        }, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+
+    # Close all queue rows matching this mapping
+    close_res = await db.unresolved_sku_queue.update_many(
+        {**key, "status": "open"},
+        {"$set": {"status": "mapped", "mapped_at": now, "mapped_by": u["email"]}},
+    )
+
+    await log_activity("UPDATE", "unresolved_sku_queue",
+                        f"Mapped {payload.marketplace}:{payload.marketplace_style_code}/{payload.marketplace_color_code} → {style['code']}/{payload.erp_color_code} (closed {close_res.modified_count} queue rows)",
+                        u["email"])
+    return {
+        "ok":            True,
+        "mapping_key":   key,
+        "closed_queue_rows": close_res.modified_count,
+    }
+
+
+@api.delete("/marketplace/unresolved/{qid}")
+async def dismiss_unresolved(request: Request, qid: str):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    try:
+        res = await db.unresolved_sku_queue.update_one(
+            {"_id": ObjectId(qid)},
+            {"$set": {"status": "dismissed", "dismissed_at": now_iso(), "dismissed_by": u["email"]}},
+        )
+    except Exception:
+        raise HTTPException(404, "Queue item not found")
+    if not res.matched_count:
+        raise HTTPException(404, "Queue item not found")
+    return {"ok": True}
+
+
 @app.get("/")
 async def root():
     return {
@@ -7688,6 +8208,38 @@ async def on_startup():
             log.info(f"WMS: seeded {inserted} warehouse cells")
     except Exception as e:
         log.warning(f"WMS auto-seed failed: {e}")
+
+    # Marketplace SKU Resolver: indexes + seed default parser templates
+    try:
+        await db.sku_parser_templates.create_index("marketplace", unique=True,
+                                                    name="sku_parser_marketplace_unique")
+    except Exception as e:
+        log.warning(f"Could not create sku_parser_templates index: {e}")
+
+    try:
+        await db.marketplace_style_color_mapping.create_index(
+            [("marketplace", 1), ("marketplace_style_code", 1), ("marketplace_color_code", 1)],
+            unique=True, name="mp_scm_unique",
+        )
+        await db.marketplace_style_color_mapping.create_index("erp_style_code", name="mp_scm_erp_style")
+    except Exception as e:
+        log.warning(f"Could not create marketplace_style_color_mapping indexes: {e}")
+
+    try:
+        await db.unresolved_sku_queue.create_index(
+            [("marketplace", 1), ("marketplace_style_code", 1), ("marketplace_color_code", 1),
+             ("raw_sku", 1)], unique=True, name="unresolved_sku_unique",
+        )
+        await db.unresolved_sku_queue.create_index("status", name="unresolved_sku_status")
+    except Exception as e:
+        log.warning(f"Could not create unresolved_sku_queue indexes: {e}")
+
+    try:
+        seeded = await _seed_parser_templates()
+        if seeded:
+            log.info(f"Marketplace: seeded {seeded} default parser templates")
+    except Exception as e:
+        log.warning(f"Parser template seed failed: {e}")
 
     await seed_admin(db)
     try:
