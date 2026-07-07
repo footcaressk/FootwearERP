@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, EmailStr, field_validator
 from pydantic_core import PydanticCustomError
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
+from pymongo import ReturnDocument
 
 import jwt
 from auth import (
@@ -165,6 +166,130 @@ async def log_activity(action: str, category: str, details: str, email: str):
         log.warning(f"Failed to write audit log: {e}")
 
 
+# ---------- System-generated style codes + catalogue SKU builder ----------
+# Every NEW style gets an immutable, system-generated code of the form SSK_XXXXX
+# via an atomic counter increment on the `counters` collection. This code becomes
+# the naming convention used everywhere, including as the base for catalogue SKUs
+# handed to marketplaces (Myntra, Ajio, Flipkart, Nykaa, Website).
+
+STYLE_CODE_PREFIX = "SSK_"
+STYLE_CODE_PAD = 5   # SSK_00001, SSK_00002, ...
+STYLE_CODE_RE = re.compile(rf"^{re.escape(STYLE_CODE_PREFIX)}\d{{{STYLE_CODE_PAD},}}$")
+
+
+async def _next_style_code() -> str:
+    """Atomically increment the style_code counter and return the next code.
+
+    Uses find_one_and_update with $inc + upsert — the standard Mongo pattern for
+    a strictly-increasing counter that is safe under concurrent inserts. Never
+    counts existing styles or scans for max — those race.
+    """
+    doc = await db.counters.find_one_and_update(
+        {"_id": "style_code"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    seq = int(doc.get("seq", 1))
+    return f"{STYLE_CODE_PREFIX}{seq:0{STYLE_CODE_PAD}d}"
+
+
+def build_catalogue_sku(style_code: str, color_code: str, size: Optional[str] = None) -> str:
+    """Canonical catalogue-SKU builder — MUST be used everywhere a catalogue
+    SKU needs to be produced so the format never drifts.
+
+    - Style + colour (used as the marketplace "group id" / Style Id):
+        f"{style_code}-{color_code}"       → "SSK_00001-TN"
+    - Style + colour + size (fully-unique leaf SKU on each marketplace row):
+        f"{style_code}-{color_code}-{size}"→ "SSK_00001-TN-38"
+    """
+    sc = (style_code or "").strip()
+    cc = (color_code or "").strip().upper()
+    if not sc or not cc:
+        return ""
+    if size is None or str(size).strip() == "":
+        return f"{sc}-{cc}"
+    return f"{sc}-{cc}-{str(size).strip()}"
+
+
+# ---------- Colour master seed vocabulary ----------
+# Short uppercase codes (2-3 letters) used by build_catalogue_sku. Chosen to
+# avoid collisions across the current colour palette visible in the styles
+# catalogue. Admin can add more via POST /api/color-master.
+DEFAULT_COLOR_MASTER = [
+    ("Tan",         "TN"),
+    ("Beige",       "BG"),
+    ("Gold",        "GD"),
+    ("Silver",      "SL"),
+    ("Blue",        "BL"),
+    ("Navy",        "NV"),
+    ("Brown",       "BR"),
+    ("Gunmetal",    "GN"),
+    ("Maroon",      "MR"),
+    ("Pink",        "PK"),
+    ("Black",       "BK"),
+    ("White",       "WH"),
+    ("Cream",       "CR"),
+    ("Deep Peach",  "DP"),
+    ("Grey",        "GY"),
+    ("Red",         "RD"),
+    ("Green",       "GR"),
+    ("Yellow",      "YL"),
+    ("Orange",      "OR"),
+    ("Purple",      "PR"),
+    ("Rose Gold",   "RG"),
+    ("Copper",      "CP"),
+    ("Bronze",      "BZ"),
+    ("Nude",        "ND"),
+    ("Olive",       "OV"),
+]
+
+
+async def _seed_color_master() -> int:
+    """Idempotently seed the color_master collection with the default palette."""
+    # Ensure a unique index on color_code so build_catalogue_sku always resolves 1:1
+    try:
+        await db.color_master.create_index("color_code", unique=True, name="color_master_code_unique")
+    except Exception as e:
+        log.warning(f"Could not create color_master unique index: {e}")
+    # Also index by lowercase name for fast lookup
+    try:
+        await db.color_master.create_index("color_name_lc", name="color_master_name_lc")
+    except Exception as e:
+        log.warning(f"Could not create color_master name index: {e}")
+
+    inserted = 0
+    for name, code in DEFAULT_COLOR_MASTER:
+        existing = await db.color_master.find_one({"color_code": code})
+        if existing:
+            continue
+        # Also skip if the name already exists under a different code
+        by_name = await db.color_master.find_one({"color_name_lc": name.lower()})
+        if by_name:
+            continue
+        await db.color_master.insert_one({
+            "color_name":    name,
+            "color_name_lc": name.lower(),
+            "color_code":    code,
+            "active":        True,
+            "created_at":    now_iso(),
+            "updated_at":    now_iso(),
+        })
+        inserted += 1
+    return inserted
+
+
+async def resolve_color_code(color_name: str) -> Optional[str]:
+    """Look up a colour's short code by name (case-insensitive)."""
+    if not color_name:
+        return None
+    doc = await db.color_master.find_one({
+        "color_name_lc": color_name.strip().lower(),
+        "active": {"$ne": False},
+    })
+    return doc["color_code"] if doc else None
+
+
 # ---------- Pydantic models ----------
 Role = Literal["admin", "manager", "production", "sales", "operator"]
 
@@ -231,7 +356,10 @@ class LaborItem(BaseModel):
     rate: float  # per pair
 
 class StyleIn(BaseModel):
-    code: str
+    # code is IGNORED on create — system always generates an SSK_XXXXX style code
+    # via _next_style_code() (see build_catalogue_sku). On update, code is
+    # immutable and any provided value is stripped by the endpoint.
+    code: Optional[str] = ""
     name: str
     category: Optional[str] = "Footwear"
     image_url: Optional[str] = ""
@@ -3110,37 +3238,52 @@ async def get_style(sid: str, request: Request):
 @api.post("/styles")
 async def create_style(payload: StyleIn, request: Request):
     u = await get_current_user(request); require_roles("admin", "manager")(u)
-    code = payload.code.strip()
-    if await db.styles.find_one({"code": {"$regex": f"^{re.escape(code)}$", "$options": "i"}}):
-        raise HTTPException(status_code=409, detail=f"Style code '{code}' already exists")
-    payload.code = code
+    # System ALWAYS generates the style code — any user-supplied `code` is
+    # ignored to guarantee uniqueness and format consistency (SSK_XXXXX).
     doc = payload.model_dump()
+    # Retry loop to survive the (astronomically unlikely) case where two
+    # concurrent creates receive the same seq before the unique index is hit.
+    generated_code = None
+    for _ in range(5):
+        candidate = await _next_style_code()
+        if not await db.styles.find_one({"code": candidate}):
+            generated_code = candidate
+            break
+    if not generated_code:
+        raise HTTPException(500, "Failed to generate a unique style code — please retry")
+    doc["code"] = generated_code
     doc["status"] = "active" if len(doc.get("bom", [])) > 0 else "inactive"
     doc["created_at"] = now_iso()
     doc["updated_at"] = now_iso()
     try:
         res = await db.styles.insert_one(doc)
     except DuplicateKeyError:
-        raise HTTPException(status_code=409, detail=f"Style code '{code}' already exists")
+        raise HTTPException(status_code=409, detail=f"Style code '{generated_code}' collision — please retry")
     doc.pop("_id", None)
     doc["id"] = str(res.inserted_id)
     doc["costing"] = compute_style_costing(doc)
+    await log_activity("style.create", "styles",
+                       f"Created style {generated_code} — {doc.get('name','')}", u["email"])
     return doc
 
 @api.patch("/styles/{sid}")
 async def update_style(sid: str, payload: StyleIn, request: Request):
     u = await get_current_user(request); require_roles("admin", "manager")(u)
-    code = payload.code.strip()
-    if await db.styles.find_one({"code": {"$regex": f"^{re.escape(code)}$", "$options": "i"}, "_id": {"$ne": oid(sid)}}):
-        raise HTTPException(status_code=409, detail=f"Style code '{code}' already exists")
-    payload.code = code
+    existing = await db.styles.find_one({"_id": oid(sid)})
+    if not existing:
+        raise HTTPException(404, "Style not found")
     update = payload.model_dump()
+    # style.code is IMMUTABLE — silently drop any incoming value so it can
+    # never drift from the SSK_XXXXX assigned at creation.
+    supplied_code = (update.pop("code", "") or "").strip()
+    if supplied_code and supplied_code != existing.get("code", ""):
+        raise HTTPException(
+            400,
+            f"Style code is immutable — attempted to change '{existing.get('code','')}' to '{supplied_code}'"
+        )
     update["status"] = "active" if len(update.get("bom", [])) > 0 else "inactive"
     update["updated_at"] = now_iso()
-    try:
-        await db.styles.update_one({"_id": oid(sid)}, {"$set": update})
-    except DuplicateKeyError:
-        raise HTTPException(status_code=409, detail=f"Style code '{code}' already exists")
+    await db.styles.update_one({"_id": oid(sid)}, {"$set": update})
     d = stringify(await db.styles.find_one({"_id": oid(sid)}))
     d["costing"] = compute_style_costing(d)
     return d
@@ -3150,6 +3293,199 @@ async def delete_style(sid: str, request: Request):
     u = await get_current_user(request); require_roles("admin", "manager")(u)
     await db.styles.delete_one({"_id": oid(sid)})
     return {"ok": True}
+
+
+# ---------- CATALOGUE CODES ----------
+# For a given style, resolve every planned colour and size, and build the
+# canonical marketplace SKUs via build_catalogue_sku(). Used by the frontend
+# "Catalogue Codes" panel so merchandisers can see exactly what SKUs will go
+# into each platform's listing file before Phase F generates the export.
+@api.get("/styles/{sid}/catalogue-codes")
+async def get_style_catalogue_codes(sid: str, request: Request):
+    await get_current_user(request)
+    style = await db.styles.find_one({"_id": oid(sid)})
+    if not style:
+        raise HTTPException(404, "Style not found")
+    style_code = style.get("code", "")
+
+    # 1. Prefer planned colours & sizes from style_lifecycle (Phase 5 canonical source)
+    lifecycle = await db.style_lifecycle.find_one({"style_id": str(style["_id"])})
+    colors: List[str] = []
+    sizes: List[str] = []
+    if lifecycle:
+        colors = [c for c in (lifecycle.get("planned_colors") or []) if c]
+        sizes = [str(s) for s in (lifecycle.get("planned_sizes") or []) if s]
+
+    # 2. Fall back to distinct colours & sizes present in fg_inventory
+    if not colors or not sizes:
+        cursor = db.fg_inventory.find({"style_id": str(style["_id"])})
+        cset, sset = set(), set()
+        async for r in cursor:
+            if r.get("color"): cset.add(r["color"])
+            if r.get("size"):  sset.add(str(r["size"]))
+        if not colors: colors = sorted(cset)
+        if not sizes:
+            # Try natural numeric sort where possible
+            def _ssort(x):
+                try:    return (0, int(x))
+                except: return (1, x)
+            sizes = sorted(sset, key=_ssort)
+
+    # 3. Resolve each colour → colour_code via color_master. If the colour
+    # isn't in the master yet, surface that so the UI can prompt the admin
+    # to add it. Never invent codes ad hoc — that defeats the whole point of
+    # the canonical builder.
+    color_rows = []
+    for cname in colors:
+        code = await resolve_color_code(cname)
+        group_sku = build_catalogue_sku(style_code, code) if code else ""
+        color_rows.append({
+            "color_name":  cname,
+            "color_code":  code or "",
+            "mapped":      bool(code),
+            "group_sku":   group_sku,   # style + colour (marketplace Style Id)
+            "size_skus":   [
+                {
+                    "size":     sz,
+                    "leaf_sku": build_catalogue_sku(style_code, code, sz) if code else "",
+                }
+                for sz in sizes
+            ],
+        })
+
+    unmapped_colors = [r["color_name"] for r in color_rows if not r["mapped"]]
+
+    return {
+        "style_id":         str(style["_id"]),
+        "style_code":       style_code,
+        "style_name":       style.get("name", ""),
+        "colors":           colors,
+        "sizes":            sizes,
+        "rows":             color_rows,
+        "unmapped_colors":  unmapped_colors,
+    }
+
+
+# ---------- COLOR MASTER ----------
+class ColorMasterIn(BaseModel):
+    color_name: str
+    color_code: str
+    active: bool = True
+
+    @field_validator("color_code")
+    @classmethod
+    def _upper_code(cls, v: str) -> str:
+        v = (v or "").strip().upper()
+        if not (2 <= len(v) <= 3) or not v.isalpha():
+            raise PydanticCustomError(
+                "color_code_format",
+                "color_code must be 2-3 uppercase letters (e.g. TN, GN)",
+            )
+        return v
+
+    @field_validator("color_name")
+    @classmethod
+    def _clean_name(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise PydanticCustomError("color_name_empty", "color_name is required")
+        return v
+
+
+class ColorMasterUpdate(BaseModel):
+    color_name: Optional[str] = None
+    color_code: Optional[str] = None
+    active: Optional[bool] = None
+
+    @field_validator("color_code")
+    @classmethod
+    def _upper_code_opt(cls, v):
+        if v is None:
+            return v
+        v = v.strip().upper()
+        if not (2 <= len(v) <= 3) or not v.isalpha():
+            raise PydanticCustomError(
+                "color_code_format",
+                "color_code must be 2-3 uppercase letters",
+            )
+        return v
+
+
+@api.get("/color-master")
+async def list_color_master(request: Request, active: Optional[bool] = None, search: Optional[str] = None):
+    await get_current_user(request)
+    q: Dict[str, Any] = {}
+    if active is not None:
+        q["active"] = active
+    if search:
+        rgx = {"$regex": re.escape(search), "$options": "i"}
+        q["$or"] = [{"color_name": rgx}, {"color_code": rgx}]
+    docs = await db.color_master.find(q).sort("color_name", 1).to_list(1000)
+    return [stringify(d) for d in docs]
+
+
+@api.post("/color-master")
+async def create_color(payload: ColorMasterIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    # Enforce uniqueness on code (case-insensitive) and name (case-insensitive)
+    if await db.color_master.find_one({"color_code": payload.color_code}):
+        raise HTTPException(409, f"color_code '{payload.color_code}' already exists")
+    if await db.color_master.find_one({"color_name_lc": payload.color_name.lower()}):
+        raise HTTPException(409, f"color_name '{payload.color_name}' already exists")
+    doc = {
+        "color_name":    payload.color_name,
+        "color_name_lc": payload.color_name.lower(),
+        "color_code":    payload.color_code,
+        "active":        payload.active,
+        "created_at":    now_iso(),
+        "updated_at":    now_iso(),
+    }
+    try:
+        res = await db.color_master.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, f"color_code '{payload.color_code}' already exists")
+    doc.pop("_id", None)
+    doc["id"] = str(res.inserted_id)
+    await log_activity("color.create", "color_master",
+                       f"Added colour {payload.color_name} ({payload.color_code})", u["email"])
+    return doc
+
+
+@api.put("/color-master/{cid}")
+async def update_color(cid: str, payload: ColorMasterUpdate, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    existing = await db.color_master.find_one({"_id": oid(cid)})
+    if not existing:
+        raise HTTPException(404, "Colour not found")
+    update: Dict[str, Any] = {}
+    if payload.color_name is not None:
+        # Uniqueness: another doc with same lc name?
+        by_name = await db.color_master.find_one({
+            "color_name_lc": payload.color_name.lower(),
+            "_id": {"$ne": oid(cid)},
+        })
+        if by_name:
+            raise HTTPException(409, f"color_name '{payload.color_name}' already exists")
+        update["color_name"]    = payload.color_name
+        update["color_name_lc"] = payload.color_name.lower()
+    if payload.color_code is not None:
+        by_code = await db.color_master.find_one({
+            "color_code": payload.color_code,
+            "_id": {"$ne": oid(cid)},
+        })
+        if by_code:
+            raise HTTPException(409, f"color_code '{payload.color_code}' already exists")
+        update["color_code"] = payload.color_code
+    if payload.active is not None:
+        update["active"] = payload.active
+    if not update:
+        return stringify(existing)
+    update["updated_at"] = now_iso()
+    await db.color_master.update_one({"_id": oid(cid)}, {"$set": update})
+    fresh = await db.color_master.find_one({"_id": oid(cid)})
+    await log_activity("color.update", "color_master",
+                       f"Updated colour {fresh.get('color_name')} ({fresh.get('color_code')})", u["email"])
+    return stringify(fresh)
 
 
 # ---------- COSTING (live preview) ----------
@@ -8242,6 +8578,12 @@ async def on_startup():
         log.warning(f"Parser template seed failed: {e}")
 
     await seed_admin(db)
+    try:
+        seeded = await _seed_color_master()
+        if seeded:
+            log.info(f"Color master: seeded {seeded} default colours")
+    except Exception as e:
+        log.warning(f"Color master seed failed: {e}")
     try:
         profile = await db.settings.find_one({"_id": "company_profile"})
         if profile:

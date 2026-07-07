@@ -275,20 +275,61 @@ frontend:
 
 metadata:
   created_by: "main_agent"
-  version: "phase-wms-warehouse-management"
-  test_sequence: 5
+  version: "phase-style-code-catalogue-sku"
+  test_sequence: 6
   run_ui: false
 
 test_plan:
   current_focus:
-    - "WMS Phase 1 — Warehouse locations + auto-allocation"
-    - "WMS Phase 2 — Picklists + FIFO + scan-to-pick"
-    - "WMS Phase 3 — Reports (capacity, utilization, picking efficiency)"
-    - "WMS Phase 4 — Pending Product List"
-    - "WMS Phase 5 — Online-order import integration (option c)"
+    - "Phase — System-generated SSK_XXXXX style code (counters)"
+    - "Phase — Style code immutability on PATCH"
+    - "Phase — Color Master CRUD + seed"
+    - "Phase — Catalogue codes endpoint (build_catalogue_sku)"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
+
+backend:
+  - task: "Phase — System-generated SSK_XXXXX style code + immutability + color_master + catalogue codes"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Implemented: (1) `counters` collection with atomic increment via find_one_and_update($inc, upsert, ReturnDocument.AFTER) — helper _next_style_code() returns SSK_00001, SSK_00002, ... (2) POST /api/styles now ALWAYS system-generates the code — any user-supplied `code` field is ignored. StyleIn.code made Optional. (3) PATCH /api/styles/{sid} blocks any change to code with 400 'Style code is immutable — attempted to change X to Y'. Client-side also strips `code` before PATCH. (4) New `color_master` collection with unique index on color_code (case-insensitive via upper() normalisation) + color_name_lc index. Auto-seeded 25 default colours (Tan/TN, Beige/BG, Gold/GD, Silver/SL, Blue/BL, Navy/NV, Brown/BR, Gunmetal/GN, Maroon/MR, Pink/PK, Black/BK, White/WH, Cream/CR, Deep Peach/DP, Grey/GY, Red/RD, Green/GR, Yellow/YL, Orange/OR, Purple/PR, Rose Gold/RG, Copper/CP, Bronze/BZ, Nude/ND, Olive/OV). (5) New endpoints: GET/POST /api/color-master, PUT /api/color-master/{cid}. POST validates color_code is 2-3 alpha chars, uppercased. Duplicate code returns 409. (6) Canonical build_catalogue_sku(style_code, color_code, size=None) helper — group SKU 'SSK_00001-TN', leaf SKU 'SSK_00001-TN-38'. (7) New endpoint GET /api/styles/{sid}/catalogue-codes — resolves planned_colors × planned_sizes from style_lifecycle (falls back to distinct fg_inventory values), returns {style_code, colors, sizes, rows: [{color_name, color_code, mapped, group_sku, size_skus:[{size, leaf_sku}]}], unmapped_colors}. Manual smoke-tested end-to-end via curl: created 2 styles (received SSK_00001, SSK_00002 in order), PATCH with different code correctly rejected, PATCH with same code succeeded, color CRUD (create Turquoise/TQ, duplicate TN rejected 409, bad format XXXX rejected 422), catalogue-codes for style with planned_colors=[Tan,Gunmetal,Silver,Turquoise] × planned_sizes=[36..40] returned 20 leaf SKUs correctly formatted."
+        - working: true
+          agent: "testing"
+          comment: "✅ ALL 5/5 TEST SUITES PASSED (100% success rate). Comprehensive end-to-end verification of SSK_XXXXX style code generation, immutability, color master CRUD, and catalogue codes endpoint completed successfully. Test file: /app/backend_test_ssk_catalogue.py. TESTED: (1) SSK Style Code Generation: POST /api/styles without code → generates SSK_XXXXX matching ^SSK_\\d{5}$ pattern ✓ POST with user-supplied code='MANUAL-XYZ' → ignored, system generates SSK_XXXXX ✓ 3 consecutive creates → strictly ascending codes (SSK_00022, SSK_00023, SSK_00024) ✓ Atomic counter working correctly ✓ (2) Style Code Immutability: PATCH with different code → 400 with 'Style code is immutable — attempted to change X to Y' message ✓ PATCH with matching code → 200, name updated, code unchanged ✓ PATCH without code field → 200, name updated, code unchanged ✓ GET confirms code never changed ✓ (3) Color Master Seed + CRUD: GET /api/color-master returns 28 colors (>= 25 required) ✓ All 8 required pairs exist: (Tan, TN), (Beige, BG), (Gold, GD), (Silver, SL), (Blue, BL), (Gunmetal, GN), (Black, BK), (Deep Peach, DP) ✓ POST with lowercase code → uppercased to uppercase ✓ POST duplicate code → 409 ✓ POST duplicate name → 409 ✓ POST invalid code (too long 'XXXX') → 422 ✓ POST invalid code (non-alpha '1A') → 422 ✓ POST empty name → 422 ✓ PUT to set active=false → 200 ✓ PUT duplicate code on update → 409 ✓ PUT to update name → 200 ✓ GET with search filter → works correctly ✓ GET with active=false filter → returns only inactive colors ✓ (4) Catalogue Codes Endpoint: Created style with lifecycle (planned_colors=['Tan','Gunmetal','Silver','UnmappedColor'], planned_sizes=['36','37','38','39','40']) ✓ GET /api/styles/{id}/catalogue-codes returns correct structure with all required keys (style_id, style_code, style_name, colors, sizes, rows, unmapped_colors) ✓ Tan row: color_code='TN', mapped=true, group_sku='SSK_00031-TN', size_skus has 5 entries, size '38' leaf_sku='SSK_00031-TN-38' ✓ Gunmetal row: color_code='GN', mapped=true, group_sku='SSK_00031-GN' ✓ Silver row: color_code='SL', mapped=true, group_sku='SSK_00031-SL' ✓ Unmapped color row: color_code='', mapped=false, group_sku='', all leaf_skus empty ✓ unmapped_colors array contains unmapped color ✓ After adding unmapped color to color_master → row becomes mapped=true with correct group_sku and leaf_skus ✓ unmapped_colors becomes empty array ✓ Style without lifecycle → returns empty colors/sizes/rows arrays (fallback path) ✓ (5) Regression Smoke: POST /api/auth/login → 200 ✓ GET /api/fg-inventory → 200 ✓ POST /api/fg-inventory/movements → 200 ✓ GET /api/fg-inventory/movements → 200 ✓ GET /api/sku-map → 200 ✓ GET /api/style-lifecycle/{style_id} → 200 ✓ NO ISSUES FOUND. All SSK_XXXXX style code, color master, and catalogue codes endpoints working perfectly as specified."
+
+frontend:
+  - task: "Phase — Styles form: remove manual code input; add Catalogue Codes panel"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/Styles.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Styles.jsx changes: (1) Removed manual Style Code text input on new-style form; replaced with a read-only pill showing 'Auto-assigned on save (SSK_XXXXX)' before creation and the assigned code with an 'immutable' badge after creation. (2) `save()` never sends `code` in POST body; strips `code` from PATCH body defensively; after a successful create, transitions the drawer into edit-mode for the new style so the user immediately sees the assigned SSK_XXXXX code and Catalogue Codes panel. (3) New 'Catalogue Codes' panel (amber-themed) in edit drawer: shows a table of Colour · Code · Group SKU (style·colour) · Leaf SKUs (style·colour·size) generated from GET /api/styles/{id}/catalogue-codes. Highlights unmapped colours in red with a warning banner directing admin to add them to Color Master. Refresh button re-fetches."
+
+test_plan:
+  current_focus:
+    - "Phase — System-generated SSK_XXXXX style code + immutability + color_master + catalogue codes"
+  stuck_tasks: []
+  test_all: false
+  test_priority: "high_first"
+
+agent_communication:
+    - agent: "main"
+      message: "Please test the new SSK-code + Color Master + Catalogue Codes backend endpoints end-to-end: (1) POST /api/styles with any/no code — response.code MUST match ^SSK_\\d{5}$ and be exactly the next atomic counter value. Create 3 in sequence and verify strictly ascending. Any user-supplied 'code' in the body must be IGNORED (not returned as-is). (2) GET /api/styles list returns them with the generated codes. (3) PATCH /api/styles/{id} with a body that includes a different `code` → 400 with 'Style code is immutable' message. Same PATCH with matching code or without code → 200 (other fields updated). (4) GET /api/color-master returns 25 default colours seeded on startup, each with {color_name, color_code (2-3 upper), active}. (5) POST /api/color-master {color_name:'Turquoise', color_code:'tq'} → 201/200 with code stored as 'TQ'. Duplicate code 'TN' → 409. Bad code 'XXXX' → 422. Bad code '1A' → 422. (6) PUT /api/color-master/{cid} updates active/name/code. Duplicate on update → 409. (7) GET /api/styles/{id}/catalogue-codes for a style with lifecycle.planned_colors=[Tan,Gunmetal] and planned_sizes=[36,37,38] → rows has 2 entries, each with group_sku like 'SSK_XXXXX-TN' and size_skus with 3 entries each ('SSK_XXXXX-TN-36' etc.). If planned_colors includes an unmapped colour like 'Zebra', unmapped_colors=['Zebra'] and its row has color_code='' + group_sku=''. Falls back to fg_inventory distinct values when lifecycle empty. (8) Regression smoke: existing endpoints (auth login, /fg-inventory, /fg-inventory/movements, /sku-map, /style-lifecycle) still work. Admin login: admin@example.com / admin123."
+    - agent: "testing"
+      message: "✅ SSK_XXXXX STYLE CODE + CATALOGUE CODES BACKEND TESTING COMPLETE — ALL 5/5 TEST SUITES PASSED (100% success rate). Comprehensive end-to-end verification completed successfully. All requirements from the review request verified: (1) SSK style code generation with atomic counter working perfectly — codes match ^SSK_\\d{5}$ pattern, user-supplied codes are ignored, 3 consecutive creates produce strictly ascending codes ✓ (2) Style code immutability enforced — PATCH with different code returns 400 with 'immutable' message, PATCH with matching/no code succeeds ✓ (3) Color Master seeding + CRUD fully functional — 28 colors seeded (>= 25 required), all 8 required pairs exist, POST/PUT validation working (uppercase normalization, duplicate detection, format validation), search and active filters working ✓ (4) Catalogue codes endpoint working correctly — returns proper structure with style_code, colors, sizes, rows (with color_code, mapped, group_sku, size_skus), unmapped_colors array, correctly handles mapped colors (Tan/TN, Gunmetal/GN, Silver/SL) and unmapped colors (empty code/sku), after adding unmapped color to color_master it becomes mapped, fallback to empty arrays when no lifecycle ✓ (5) Regression smoke tests all passed — auth login, fg-inventory, fg-inventory/movements, sku-map, style-lifecycle all working ✓ NO ISSUES FOUND. All SSK_XXXXX style code, color master, and catalogue codes endpoints working perfectly as specified. Test file: /app/backend_test_ssk_catalogue.py"
 
 backend:
   - task: "WMS — warehouse_locations collection auto-seed 320 cells"

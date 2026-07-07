@@ -76,6 +76,23 @@ export default function Styles() {
   const [styleMappings, setStyleMappings] = useState([]);
   const [addingMapping, setAddingMapping] = useState(false);
   const [editingMappingId, setEditingMappingId] = useState(null);
+  // Catalogue codes for the currently-open style (group SKU + leaf SKUs)
+  const [catalogueCodes, setCatalogueCodes] = useState(null);
+  const [catalogueLoading, setCatalogueLoading] = useState(false);
+
+  const loadCatalogueCodes = async (styleId) => {
+    if (!styleId) return;
+    setCatalogueLoading(true);
+    try {
+      const res = await http.get(`/styles/${styleId}/catalogue-codes`);
+      setCatalogueCodes(res.data);
+    } catch (e) {
+      console.error("Failed to load catalogue codes", e);
+      setCatalogueCodes(null);
+    } finally {
+      setCatalogueLoading(false);
+    }
+  };
   const [newMapping, setNewMapping] = useState({
     source_type: "b2b_client",
     source_name: "",
@@ -229,6 +246,7 @@ export default function Styles() {
     setStyleMappings([]);
     setAddingMapping(false);
     setEditingMappingId(null);
+    setCatalogueCodes(null);
     setOpen(true);
   };
   const startEdit = (s) => {
@@ -251,8 +269,10 @@ export default function Styles() {
     setStyleMappings([]);
     setAddingMapping(false);
     setEditingMappingId(null);
+    setCatalogueCodes(null);
     setOpen(true);
     loadStyleMappings(s.id);
+    loadCatalogueCodes(s.id);
   };
   const save = async () => {
     setFormError("");
@@ -272,10 +292,27 @@ export default function Styles() {
         })),
         labor: form.labor.map((l) => ({ ...l, rate: Number(l.rate) })),
       };
-      if (editId) await http.patch(`/styles/${editId}`, body);
-      else await http.post("/styles", body);
-      setOpen(false);
-      load();
+      if (editId) {
+        // Never send `code` on update — it's immutable server-side and rejected
+        // if it doesn't match the current value. Strip it here to be safe.
+        // eslint-disable-next-line no-unused-vars
+        const { code: _ignored, ...bodyNoCode } = body;
+        await http.patch(`/styles/${editId}`, bodyNoCode);
+        setOpen(false);
+        load();
+      } else {
+        // Do NOT send a code — backend always generates SSK_XXXXX
+        // eslint-disable-next-line no-unused-vars
+        const { code: _ignored, ...bodyNoCode } = body;
+        const res = await http.post("/styles", bodyNoCode);
+        // Slide into edit-mode for the newly-created style so the user sees
+        // the assigned SSK_XXXXX code and the Catalogue Codes panel.
+        setEditId(res.data.id);
+        setForm((f) => ({ ...f, code: res.data.code }));
+        loadStyleMappings(res.data.id);
+        loadCatalogueCodes(res.data.id);
+        load();
+      }
     } catch (e) {
       setFormError(e.response?.data?.detail || e.message);
     }
@@ -579,15 +616,30 @@ export default function Styles() {
             <div className="col-span-1 lg:col-span-2 space-y-4">
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <Input
-                    label="Style Code"
-                    value={form.code}
-                    onChange={(e) => {
-                      setFormError("");
-                      setForm({ ...form, code: e.target.value });
-                    }}
-                    testId="form-style-code"
-                  />
+                  {/* Style Code is system-generated (SSK_XXXXX) and immutable —
+                      never accept manual input. Show a pill when known, else
+                      an "auto-assigned on save" hint. */}
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-neutral-500 mb-1">
+                    Style Code
+                  </label>
+                  {form.code ? (
+                    <div
+                      className="h-10 px-3 flex items-center gap-2 rounded-md border border-neutral-200 bg-neutral-50 font-mono text-sm text-neutral-900"
+                      data-testid="form-style-code"
+                    >
+                      <span className="font-semibold">{form.code}</span>
+                      <span className="ml-auto text-[10px] uppercase tracking-wider text-neutral-500 bg-white border border-neutral-200 rounded px-1.5 py-0.5">
+                        immutable
+                      </span>
+                    </div>
+                  ) : (
+                    <div
+                      className="h-10 px-3 flex items-center rounded-md border border-dashed border-neutral-300 bg-neutral-50/50 text-xs text-neutral-500 italic"
+                      data-testid="form-style-code-placeholder"
+                    >
+                      Auto-assigned on save (SSK_XXXXX)
+                    </div>
+                  )}
                   {formError && (
                     <p
                       className="mt-1 text-xs font-medium text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2"
@@ -935,6 +987,97 @@ export default function Styles() {
                   }
                 />
               </div>
+
+              {/* Catalogue Codes — SSK-generated marketplace SKUs */}
+              {editId && (
+                <div className="border-2 border-amber-200 p-4 mt-6 bg-amber-50/50" data-testid="catalogue-codes-panel">
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-sm font-bold uppercase tracking-wider flex items-center gap-1.5 text-amber-900">
+                      <CalcIcon className="w-4 h-4 text-amber-600" />
+                      Catalogue Codes
+                    </h3>
+                    <button
+                      onClick={() => loadCatalogueCodes(editId)}
+                      className="text-[11px] uppercase tracking-wider text-amber-700 hover:text-amber-900 font-semibold"
+                      data-testid="catalogue-codes-refresh"
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-amber-800/80 mb-3 leading-snug">
+                    Generated from <span className="font-mono font-semibold">{form.code || "SSK_XXXXX"}</span> and the planned colour/size matrix.
+                    <span className="mx-1">·</span>
+                    Group SKU = <span className="font-mono">{form.code || "SSK_XXXXX"}-COLOR</span>
+                    <span className="mx-1">·</span>
+                    Leaf SKU = <span className="font-mono">{form.code || "SSK_XXXXX"}-COLOR-SIZE</span>
+                  </p>
+                  {catalogueLoading ? (
+                    <div className="text-xs text-neutral-500 italic">Loading catalogue codes…</div>
+                  ) : !catalogueCodes ? (
+                    <div className="text-xs text-neutral-500 italic">No catalogue data available.</div>
+                  ) : catalogueCodes.rows.length === 0 ? (
+                    <div className="text-xs text-neutral-600 bg-white border border-neutral-200 rounded p-3">
+                      No colours/sizes planned yet — set them on the Style Lifecycle page (planned_colors &amp; planned_sizes) to generate catalogue SKUs.
+                    </div>
+                  ) : (
+                    <>
+                      {catalogueCodes.unmapped_colors.length > 0 && (
+                        <div className="mb-3 text-xs bg-red-50 border border-red-200 rounded px-3 py-2 text-red-800">
+                          <span className="font-semibold">Missing colour codes:</span>{" "}
+                          {catalogueCodes.unmapped_colors.join(", ")}. Add them under Color Master before catalogue export.
+                        </div>
+                      )}
+                      <div className="overflow-x-auto bg-white border border-neutral-200 rounded">
+                        <table className="w-full text-xs">
+                          <thead className="bg-neutral-100 text-[10px] uppercase tracking-wider text-neutral-600">
+                            <tr>
+                              <th className="text-left p-2 border-b border-neutral-200">Colour</th>
+                              <th className="text-left p-2 border-b border-neutral-200">Code</th>
+                              <th className="text-left p-2 border-b border-neutral-200">Group SKU (style · colour)</th>
+                              <th className="text-left p-2 border-b border-neutral-200">Leaf SKUs (style · colour · size)</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {catalogueCodes.rows.map((r) => (
+                              <tr key={r.color_name} className="border-b border-neutral-100 last:border-b-0">
+                                <td className="p-2 font-medium">{r.color_name}</td>
+                                <td className="p-2">
+                                  {r.mapped ? (
+                                    <span className="font-mono font-semibold text-neutral-900">{r.color_code}</span>
+                                  ) : (
+                                    <span className="text-red-600 italic text-[11px]">unmapped</span>
+                                  )}
+                                </td>
+                                <td className="p-2">
+                                  {r.group_sku ? (
+                                    <span className="font-mono font-semibold text-amber-900 bg-amber-100 px-2 py-0.5 rounded">
+                                      {r.group_sku}
+                                    </span>
+                                  ) : (
+                                    <span className="text-neutral-400 italic">—</span>
+                                  )}
+                                </td>
+                                <td className="p-2">
+                                  <div className="flex flex-wrap gap-1">
+                                    {r.size_skus.map((s) => (
+                                      <span
+                                        key={s.size}
+                                        className="font-mono text-[11px] bg-neutral-100 border border-neutral-200 px-1.5 py-0.5 rounded"
+                                      >
+                                        {s.leaf_sku || `${s.size} · unmapped`}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
 
               {/* External Codes / mappings */}
               {editId && (
