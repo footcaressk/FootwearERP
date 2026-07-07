@@ -4432,12 +4432,26 @@ DISPATCH_CANONICAL_FIELDS = [
     "product_title", "qty",             # qty defaults to 1 per row for dispatch files
 ]
 
+# Canonical MONTHLY REPORT fields — full lifecycle per order-line.
+# Same core identifiers as dispatch (order_id + order_release_id + leaf_sku)
+# plus every date column that lets us classify a row's fate:
+# packed_on, delivered_on, cancelled_on, rto_creation_date,
+# return_creation_date. Plus revenue-side columns for Phase 4 costing.
+MONTHLY_REPORT_CANONICAL_FIELDS = [
+    "order_id", "order_release_id",
+    "leaf_sku", "size", "product_title",
+    "order_status",
+    "packed_on", "delivered_on", "cancelled_on",
+    "rto_creation_date", "return_creation_date",
+    "final_amount", "total_mrp", "discount", "seller_price",
+]
+
 # ConfigRole distinguishes ORDER/PICKLIST configs (used by the online-orders
 # importer) from DISPATCH configs (used by the daily "what got packed today"
 # importer). One platform can have BOTH — e.g. Myntra ships an OP-xxxxx.csv
 # picklist AND a Packed_order_data.csv dispatch file — so the collection's
 # uniqueness key is (platform, role), not platform alone.
-ConfigRole = Literal["order", "dispatch"]
+ConfigRole = Literal["order", "dispatch", "monthly_report"]
 
 
 class OrderImportFormatConfigIn(BaseModel):
@@ -4597,6 +4611,42 @@ DEFAULT_ORDER_IMPORT_CONFIGS = [
         "is_picklist": False,
         "active": True,
         "notes": "Myntra daily dispatch file (Packed_order_data.csv). Each row = 1 unit packed. Posts a 'dispatched' fg_stock_movement — implicit-reserve fallback covers first-time dispatches where no prior reservation exists. join key across all Myntra files: order_release_id + Seller_sku_code.",
+    },
+    # ── Myntra Monthly Order Report ──────────────────────────────────────
+    # One row per order-line, full lifecycle. Source-of-truth for
+    # returns/RTO/cancellations because the daily dispatch file only
+    # records packing, not the reversals. Status alone is NOT enough
+    # (176 of 281 "F" rows have a packed_on date meaning inventory WAS
+    # consumed before cancellation; 748 of 1953 "C" rows have a
+    # return_creation_date meaning customer returned it) — classification
+    # must combine status + the date columns.
+    {
+        "platform": "myntra",
+        "role": "monthly_report",
+        "sheet_locator": {"type": "first_sheet"},
+        "header_locator": {"type": "fixed_row", "row": 0},
+        "skip_rows_after_header": 0,
+        "column_map": {
+            "order_id":             "order id fk",
+            "order_release_id":     "order release id",
+            "leaf_sku":             "seller sku code",
+            "size":                 "size",
+            "order_status":         "order status",
+            "packed_on":            "packed on",
+            "delivered_on":         "delivered on",
+            "cancelled_on":         "cancelled on",
+            "rto_creation_date":    "rto creation date",
+            "return_creation_date": "return creation date",
+            "final_amount":         "final amount",
+            "total_mrp":            "total mrp",
+            "discount":             "discount",
+            "seller_price":         "seller price",
+        },
+        "known_sku_prefixes_to_strip": [],
+        "known_sku_prefix_replacements": {"FLL": "FL"},
+        "is_picklist": False,
+        "active": True,
+        "notes": "Myntra Monthly_order_report.csv. Row-level classification: was_packed (packed_on!=null), was_returned_to_stock (rto_creation_date OR return_creation_date OR (status=F AND was_packed)), is_pending (status in SH/PK), is_net_sold (packed AND !returned AND !pending). Drives return_restocked movements to correct inventory that the daily dispatch file missed.",
     },
 ]
 
@@ -4896,6 +4946,8 @@ async def get_order_canonical_fields(request: Request, role: str = "order"):
     await get_current_user(request)
     if role == "dispatch":
         return {"role": "dispatch", "canonical_fields": DISPATCH_CANONICAL_FIELDS}
+    if role == "monthly_report":
+        return {"role": "monthly_report", "canonical_fields": MONTHLY_REPORT_CANONICAL_FIELDS}
     return {"role": "order", "canonical_fields": ORDER_CANONICAL_FIELDS}
 
 
@@ -5745,6 +5797,615 @@ async def import_dispatch_configured(
         "import_batch_id":    import_batch_id,
         "rows":               canonical_rows,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ══ MONTHLY REPORT IMPORT (Phase 2 — inventory reconciliation) ═════════
+# ═══════════════════════════════════════════════════════════════════════
+# The monthly report is source-of-truth for RETURNS, RTO and CANCELLATIONS
+# because the daily dispatch file only records packing, not the reversals.
+#
+# Classification per row (do NOT simplify to "status == C means sold"):
+#   was_packed = packed_on is not null
+#   was_returned_to_stock = rto_creation_date IS NOT NULL
+#                        OR return_creation_date IS NOT NULL
+#                        OR (order_status == "F" AND was_packed)
+#   is_pending = order_status in ("SH", "PK")
+#   is_net_sold = was_packed AND NOT was_returned_to_stock AND NOT is_pending
+#   never_touched_inventory = NOT was_packed
+#
+# For every was_returned_to_stock row where no prior return movement
+# exists (checked by reference_id), we post an implicit "return_in"
+# (increment return_qty) then a "return_restocked" (move that unit from
+# return_qty back to ready_stock_qty). Phase 3 will override this to
+# "return_damaged" when the settlement file's return_type flags damage.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _has_val(v: Any) -> bool:
+    """True iff v is a non-empty, non-'null' string / non-null value.
+
+    Monthly report exports often carry the literal strings 'null', 'nan',
+    'None', '-' for empty date columns. Treat those as absent.
+    """
+    if v is None: return False
+    s = str(v).strip()
+    if not s: return False
+    if s.lower() in ("null", "nan", "none", "n/a", "na", "-"): return False
+    return True
+
+
+def _classify_monthly_row(canon: dict) -> dict:
+    """Apply the EXACT classification logic from the spec.
+
+    Returns the same canon dict with was_packed, was_returned_to_stock,
+    is_pending, is_net_sold, never_touched_inventory, return_reason set.
+    """
+    status = (canon.get("order_status") or "").strip().upper()
+
+    was_packed = _has_val(canon.get("packed_on"))
+    has_rto    = _has_val(canon.get("rto_creation_date"))
+    has_return = _has_val(canon.get("return_creation_date"))
+    cancelled_post_pack = (status == "F" and was_packed)
+
+    was_returned_to_stock = has_rto or has_return or cancelled_post_pack
+    is_pending    = status in ("SH", "PK")
+    is_net_sold   = was_packed and not was_returned_to_stock and not is_pending
+    never_touched = not was_packed
+
+    # Which reversal reason applies? RTO wins over customer_return wins
+    # over cancelled_after_pack (RTO is the most severe from an inventory
+    # accounting standpoint — the unit was shipped, never delivered, and
+    # returned to warehouse without customer touching it).
+    if was_returned_to_stock:
+        if   has_rto:              reason = "rto"
+        elif has_return:           reason = "customer_return"
+        elif cancelled_post_pack:  reason = "cancelled_after_pack"
+        else:                      reason = "unknown"
+    else:
+        reason = None
+
+    canon["was_packed"]              = was_packed
+    canon["was_returned_to_stock"]   = was_returned_to_stock
+    canon["is_pending"]              = is_pending
+    canon["is_net_sold"]             = is_net_sold
+    canon["never_touched_inventory"] = never_touched
+    canon["return_reason"]           = reason
+    return canon
+
+
+async def _parse_and_resolve_monthly_row(
+    raw_row: dict,
+    cfg: dict,
+    platform: str,
+    source_row_index: int,
+) -> dict:
+    """Parse one row of a monthly-report file into canonical form + classify.
+
+    Reuses the identical normalisation pipeline as order-import and
+    dispatch-import (strip_excel_apostrophe → apply_prefix_replacements
+    → strip_known_prefixes → split_leaf_sku → resolve_style). Then
+    applies the classification logic above.
+    """
+    column_map: Dict[str, Optional[str]] = cfg.get("column_map") or {}
+    prefixes     = cfg.get("known_sku_prefixes_to_strip") or []
+    replacements = cfg.get("known_sku_prefix_replacements") or {}
+
+    def _v(canon_key: str):
+        col = column_map.get(canon_key)
+        return raw_row.get(col) if col else None
+
+    def _str(k: str) -> Optional[str]:
+        s = str(_v(k) or "").strip()
+        return s if s else None
+
+    def _num(k: str) -> Optional[float]:
+        try:
+            s = str(_v(k) or "").strip()
+            if not s or not _has_val(s): return None
+            return float(s)
+        except Exception:
+            return None
+
+    canon: Dict[str, Any] = {
+        "source_row_index": source_row_index,
+        "platform":         platform,
+        "raw_row":          {k: (str(v) if v is not None else "") for k, v in raw_row.items()},
+        "flags":            [],
+        "matched":          False,
+    }
+
+    canon["order_id"]             = _str("order_id")
+    canon["order_release_id"]     = _str("order_release_id")
+    canon["size"]                 = _str("size")
+    canon["order_status"]         = _str("order_status")
+    canon["packed_on"]            = _str("packed_on")
+    canon["delivered_on"]         = _str("delivered_on")
+    canon["cancelled_on"]         = _str("cancelled_on")
+    canon["rto_creation_date"]    = _str("rto_creation_date")
+    canon["return_creation_date"] = _str("return_creation_date")
+    canon["product_title"]        = _str("product_title")
+    canon["final_amount"]         = _num("final_amount")
+    canon["total_mrp"]            = _num("total_mrp")
+    canon["discount"]             = _num("discount")
+    canon["seller_price"]         = _num("seller_price")
+
+    # ── Classify (does NOT depend on leaf_sku resolution) ──
+    _classify_monthly_row(canon)
+
+    # ── Then normalise leaf_sku (same as everywhere) ──
+    leaf_raw = str(_v("leaf_sku") or "").strip()
+    canon["leaf_sku_raw"] = leaf_raw
+    if not leaf_raw:
+        canon["flags"].append("empty_leaf_sku")
+        canon["leaf_sku"] = ""
+        canon["leaf_sku_replaced_prefix"] = None
+        canon["leaf_sku_stripped_prefix"] = None
+        canon["exception_reason"] = "leaf_sku column is empty"
+        return canon
+
+    leaf = strip_excel_apostrophe(leaf_raw)
+    leaf_after_replace, replaced_from = apply_prefix_replacements(leaf, replacements)
+    leaf_stripped, matched_prefix = strip_known_prefixes(leaf_after_replace, prefixes)
+    canon["leaf_sku_replaced_prefix"] = replaced_from
+    canon["leaf_sku_stripped_prefix"] = matched_prefix
+    canon["leaf_sku"] = leaf_stripped
+
+    group_id, size_tok, split_flags = split_leaf_sku(leaf_stripped)
+    canon["group_id"]     = group_id
+    canon["derived_size"] = size_tok
+    canon["flags"].extend(split_flags)
+
+    if not group_id or not size_tok:
+        canon["exception_reason"] = f"could not split leaf_sku '{leaf_stripped}' into group+size"
+        return canon
+
+    resolved = {"matched": False, "match_via": None}
+    for candidate in (leaf_stripped, group_id):
+        if not candidate:
+            continue
+        r = await resolve_style(
+            source_type="online_channel",
+            source_name=platform,
+            external_sku=candidate,
+        )
+        if r.get("matched"):
+            resolved = r
+            break
+    canon.update({
+        "matched":    bool(resolved.get("matched")),
+        "match_via":  resolved.get("match_via"),
+        "style_id":   resolved.get("style_id"),
+        "style_code": resolved.get("style_code"),
+        "color":      resolved.get("color") or "",
+        "size":       resolved.get("size") or (canon.get("size") or size_tok),
+    })
+    if not canon["matched"]:
+        canon["exception_reason"] = resolved.get("reason") or "no style match in sku_map"
+    return canon
+
+
+def _return_ref_id(platform: str, order_release_id: Optional[str],
+                   order_id: Optional[str], leaf_sku: str) -> str:
+    """Stable reference_id used to idempotency-check return movements."""
+    key = order_release_id or order_id or "no-order"
+    return f"monthly_return:{platform}:{key}:{leaf_sku}"
+
+
+async def _get_settlement_return_type(order_release_id: Optional[str],
+                                      leaf_sku: str) -> Optional[str]:
+    """Best-effort check into settlement_reverse_settled (Phase 3, may not
+    exist yet). Returns 'damaged' if a settlement row for this order/sku
+    flags the return as damaged/unsellable — else None.
+
+    Safe to call before Phase 3 is built: if the collection doesn't
+    exist, motor simply returns no matches and we default to restock.
+    """
+    if not order_release_id: return None
+    try:
+        doc = await db.settlement_reverse.find_one({
+            "order_release_id": order_release_id,
+            "$or": [{"leaf_sku": leaf_sku}, {"sku_id": leaf_sku}],
+        })
+    except Exception:
+        return None
+    if not doc: return None
+    rt = str(doc.get("return_type") or "").strip().lower()
+    if rt in ("damaged", "damage", "unsellable", "not_returnable"):
+        return "damaged"
+    return None
+
+
+async def _record_monthly_return(
+    *,
+    canon: dict,
+    platform: str,
+    batch_id: str,
+    user_email: str,
+) -> dict:
+    """Post return movements for a monthly-report row that came back.
+
+    Idempotent: if a prior return movement exists for the same
+    reference_id, skip (returns {"skipped": True}). Otherwise posts
+    "return_in" then either "return_restocked" or "return_damaged"
+    depending on the settlement file's return_type (Phase 3 hook).
+    """
+    style_id   = canon["style_id"]
+    style_code = canon["style_code"]
+    color      = canon["color"]
+    size       = canon.get("size") or canon.get("derived_size")
+    order_id   = canon.get("order_id")
+    order_release_id = canon.get("order_release_id")
+    leaf_sku   = canon.get("leaf_sku")
+
+    ref_id = _return_ref_id(platform, order_release_id, order_id, leaf_sku)
+
+    # Idempotency: check if we already posted a return movement for this row
+    prior = await db.fg_stock_movements.find_one({
+        "reference_id":  ref_id,
+        "movement_type": {"$in": ["return_in", "return_restocked", "return_damaged"]},
+    })
+    if prior:
+        return {"skipped": True, "reason": "prior_movement_exists"}
+
+    settlement_flag = await _get_settlement_return_type(order_release_id, leaf_sku)
+    close_type = "return_damaged" if settlement_flag == "damaged" else "return_restocked"
+
+    # Post return_in first (implicit — the item physically came back).
+    await _apply_movement(
+        FgStockMovementIn(
+            style_id=style_id, color=color, size=size,
+            movement_type="return_in", quantity=1,
+            reference_type="online_order",
+            reference_id=ref_id,
+            notes=f"[{platform}] monthly-report {canon.get('return_reason')} · batch {batch_id}",
+        ),
+        user_email,
+    )
+    # Then close it — restocked or damaged.
+    await _apply_movement(
+        FgStockMovementIn(
+            style_id=style_id, color=color, size=size,
+            movement_type=close_type, quantity=1,
+            reference_type="online_order",
+            reference_id=ref_id,
+            notes=f"[{platform}] monthly-report reconciliation · reason={canon.get('return_reason')}",
+        ),
+        user_email,
+    )
+    return {"skipped": False, "close_type": close_type}
+
+
+@api.post("/online-orders/monthly-report-import")
+async def import_monthly_report(
+    request: Request,
+    file: UploadFile = File(...),
+    platform: str = Query(..., description="e.g. 'myntra'"),
+    dry_run: bool = Query(True, description="Preview classification without touching inventory"),
+):
+    """Config-driven MONTHLY REPORT import (Phase 2 — reconciliation).
+
+    Parses the full monthly order-status file, classifies each row
+    (was_packed / was_returned_to_stock / is_pending / is_net_sold),
+    and for every was_returned_to_stock row posts return_in +
+    return_restocked (or return_damaged if Phase 3's settlement file
+    marked the return as damaged) — subject to idempotency check.
+    """
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+
+    platform_lc = (platform or "").strip().lower()
+    cfg_doc = await db.order_import_format_configs.find_one(
+        {"platform": platform_lc, "role": "monthly_report"}
+    )
+    if not cfg_doc:
+        raise HTTPException(
+            400,
+            f"No monthly-report config for platform '{platform_lc}'. "
+            "Create one via POST /api/order-import-format-configs with role='monthly_report' first."
+        )
+    if not cfg_doc.get("active", True):
+        raise HTTPException(400, f"Monthly-report config for '{platform_lc}' is inactive.")
+
+    cfg = stringify(cfg_doc)
+
+    content = await file.read()
+    filename = file.filename or "upload"
+
+    try:
+        wb = _read_workbook_or_csv(content, filename)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Could not read file: {e}")
+
+    ws, header_row_1, header = _resolve_data_sheet_and_header(wb, cfg)
+    skip_after = int(cfg.get("skip_rows_after_header") or 0)
+    data_start_row = header_row_1 + 1 + skip_after
+
+    raw_rows: List[Dict[str, Any]] = []
+    for r in range(data_start_row, ws.max_row + 1):
+        row_cells = ws[r]
+        vals = {header[i]: (row_cells[i].value if i < len(row_cells) else None)
+                for i in range(len(header)) if header[i]}
+        if not any((v not in (None, "", " ")) for v in vals.values()):
+            continue
+        raw_rows.append(vals)
+
+    canonical_rows: List[Dict[str, Any]] = []
+    for idx, raw in enumerate(raw_rows, start=data_start_row):
+        canon = await _parse_and_resolve_monthly_row(raw, cfg, platform_lc, idx)
+        canonical_rows.append(canon)
+
+    # ── Funnel stats + reason breakdown ──
+    def _count(pred) -> int:
+        return sum(1 for c in canonical_rows if pred(c))
+    stats = {
+        "total_rows":              len(canonical_rows),
+        "packed":                  _count(lambda c: c.get("was_packed")),
+        "never_touched_inventory": _count(lambda c: c.get("never_touched_inventory")),
+        "returned_to_stock":       _count(lambda c: c.get("was_returned_to_stock")),
+        "pending":                 _count(lambda c: c.get("is_pending")),
+        "net_sold":                _count(lambda c: c.get("is_net_sold")),
+        "matched":                 _count(lambda c: c.get("matched")),
+        "unmatched":               _count(lambda c: not c.get("matched")),
+        "empty_leaf_sku":          _count(lambda c: "empty_leaf_sku" in (c.get("flags") or [])),
+    }
+    breakdown = {
+        "rto":                  _count(lambda c: c.get("return_reason") == "rto"),
+        "customer_return":      _count(lambda c: c.get("return_reason") == "customer_return"),
+        "cancelled_after_pack": _count(lambda c: c.get("return_reason") == "cancelled_after_pack"),
+    }
+    stats["reason_breakdown"] = breakdown
+
+    import_batch_id = f"MREP_{platform_lc}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    committed: Dict[str, int] = {
+        "items_upserted":       0,
+        "orders_upserted":      0,
+        "returns_posted":       0,
+        "returns_skipped":      0,  # idempotency skips (already-posted)
+        "return_damaged_posted":0,
+        "exceptions_queued":    0,
+    }
+
+    if not dry_run:
+        exceptions: List[Dict[str, Any]] = []
+        for canon in canonical_rows:
+            src_row = canon.get("source_row_index")
+            order_release_id = canon.get("order_release_id")
+            order_id         = canon.get("order_id")
+
+            if not canon.get("matched") or "empty_leaf_sku" in (canon.get("flags") or []):
+                exceptions.append({
+                    "import_batch_id":  import_batch_id,
+                    "platform":         platform_lc,
+                    "kind":             "monthly_report_import",
+                    "source_row_index": src_row,
+                    "order_id":         order_id,
+                    "order_release_id": order_release_id,
+                    "leaf_sku_raw":     canon.get("leaf_sku_raw"),
+                    "leaf_sku":         canon.get("leaf_sku"),
+                    "reason":           canon.get("exception_reason") or "unresolved",
+                    "flags":            canon.get("flags"),
+                    "raw_row":          canon.get("raw_row"),
+                    "created_at":       now_iso(),
+                    "resolved":         False,
+                })
+                continue
+
+            style_id   = canon["style_id"]
+            style_code = canon["style_code"]
+            color      = canon["color"]
+            size       = canon.get("size") or canon.get("derived_size")
+
+            # ── Upsert online_order ──
+            match_q: Dict[str, Any] = {"platform": platform_lc}
+            if order_release_id: match_q["order_release_id"] = order_release_id
+            elif order_id:       match_q["order_id"]         = order_id
+            existing_order = await db.online_orders.find_one(match_q) if len(match_q) > 1 else None
+            if existing_order is None:
+                new_order = {
+                    "platform":            platform_lc,
+                    "order_id":            order_id,
+                    "order_release_id":    order_release_id,
+                    "channel":             platform_lc,
+                    "order_status":        canon.get("order_status"),
+                    "packed_on":           canon.get("packed_on"),
+                    "delivered_on":        canon.get("delivered_on"),
+                    "cancelled_on":        canon.get("cancelled_on"),
+                    "rto_creation_date":   canon.get("rto_creation_date"),
+                    "return_creation_date":canon.get("return_creation_date"),
+                    "source":              "monthly_report_import",
+                    "monthly_report_batch_id": import_batch_id,
+                    "created_at":          now_iso(),
+                    "updated_at":          now_iso(),
+                }
+                res = await db.online_orders.insert_one(new_order)
+                online_order_pk = str(res.inserted_id)
+                committed["orders_upserted"] += 1
+            else:
+                online_order_pk = str(existing_order["_id"])
+                await db.online_orders.update_one(
+                    {"_id": existing_order["_id"]},
+                    {"$set": {
+                        "order_status":         canon.get("order_status"),
+                        "packed_on":            canon.get("packed_on") or existing_order.get("packed_on"),
+                        "delivered_on":         canon.get("delivered_on"),
+                        "cancelled_on":         canon.get("cancelled_on"),
+                        "rto_creation_date":    canon.get("rto_creation_date"),
+                        "return_creation_date": canon.get("return_creation_date"),
+                        "monthly_report_batch_id": import_batch_id,
+                        "updated_at":           now_iso(),
+                    }}
+                )
+
+            # ── Upsert online_order_item with classification fields ──
+            item_q: Dict[str, Any] = {
+                "online_order_id": ObjectId(online_order_pk),
+                "style_id":        ObjectId(style_id),
+                "color":           color,
+                "size":            size,
+            }
+            existing_item = await db.online_order_items.find_one(item_q)
+
+            item_set = {
+                "platform":               platform_lc,
+                "order_id":               order_id,
+                "order_release_id":       order_release_id,
+                "style_id":               ObjectId(style_id),
+                "style_code":             style_code,
+                "color":                  color,
+                "size":                   size,
+                "leaf_sku":               canon.get("leaf_sku"),
+                "leaf_sku_raw":           canon.get("leaf_sku_raw"),
+                # ── classification (Phase 4 profit engine reads these) ──
+                "was_packed":             canon.get("was_packed"),
+                "was_returned_to_stock":  canon.get("was_returned_to_stock"),
+                "is_pending":             canon.get("is_pending"),
+                "is_net_sold":            canon.get("is_net_sold"),
+                "never_touched_inventory":canon.get("never_touched_inventory"),
+                "return_reason":          canon.get("return_reason"),
+                "order_status":           canon.get("order_status"),
+                # ── date columns from monthly file ──
+                "packed_on":              canon.get("packed_on"),
+                "delivered_on":           canon.get("delivered_on"),
+                "cancelled_on":           canon.get("cancelled_on"),
+                "rto_creation_date":      canon.get("rto_creation_date"),
+                "return_creation_date":   canon.get("return_creation_date"),
+                # ── revenue columns for Phase 4 ──
+                "final_amount":           canon.get("final_amount"),
+                "total_mrp":              canon.get("total_mrp"),
+                "discount":               canon.get("discount"),
+                "seller_price":           canon.get("seller_price"),
+                "monthly_report_batch_id":import_batch_id,
+                "source":                 (existing_item.get("source") if existing_item else "monthly_report_import"),
+                "updated_at":             now_iso(),
+            }
+            if existing_item:
+                await db.online_order_items.update_one(
+                    {"_id": existing_item["_id"]},
+                    {"$set": item_set}
+                )
+            else:
+                item_set["online_order_id"] = ObjectId(online_order_pk)
+                item_set["created_at"]      = now_iso()
+                await db.online_order_items.insert_one(item_set)
+            committed["items_upserted"] += 1
+
+            # ── If this row is was_returned_to_stock, post return movements ──
+            if canon.get("was_returned_to_stock"):
+                try:
+                    outcome = await _record_monthly_return(
+                        canon=canon, platform=platform_lc,
+                        batch_id=import_batch_id, user_email=u["email"],
+                    )
+                except HTTPException as he:
+                    exceptions.append({
+                        "import_batch_id":  import_batch_id,
+                        "platform":         platform_lc,
+                        "kind":             "monthly_report_import",
+                        "source_row_index": src_row,
+                        "order_id":         order_id,
+                        "order_release_id": order_release_id,
+                        "style_id":         style_id,
+                        "style_code":       style_code,
+                        "color":            color,
+                        "size":             size,
+                        "leaf_sku":         canon.get("leaf_sku"),
+                        "reason":           f"return movement blocked: {he.detail}",
+                        "raw_row":          canon.get("raw_row"),
+                        "created_at":       now_iso(),
+                        "resolved":         False,
+                    })
+                    continue
+                if outcome.get("skipped"):
+                    committed["returns_skipped"] += 1
+                elif outcome.get("close_type") == "return_damaged":
+                    committed["return_damaged_posted"] += 1
+                else:
+                    committed["returns_posted"] += 1
+
+        if exceptions:
+            await db.online_order_exceptions.insert_many(exceptions)
+            committed["exceptions_queued"] = len(exceptions)
+
+        await log_activity(
+            "MONTHLY_REPORT_IMPORT", "online_orders",
+            f"{platform_lc}: {committed['items_upserted']} items, "
+            f"{committed['returns_posted']} return-restocks, "
+            f"{committed['return_damaged_posted']} return-damaged, "
+            f"{committed['returns_skipped']} idempotency-skipped, "
+            f"{committed['exceptions_queued']} exceptions "
+            f"(batch {import_batch_id})",
+            u["email"],
+        )
+
+    return {
+        "platform":           platform_lc,
+        "role":               "monthly_report",
+        "filename":           filename,
+        "header_row_1_based": header_row_1,
+        "header":             header,
+        "dry_run":            dry_run,
+        "stats":              stats,
+        "committed":          committed if not dry_run else None,
+        "import_batch_id":    import_batch_id,
+        "rows":               canonical_rows,
+    }
+
+
+@api.get("/online-orders/reconciliation-summary")
+async def reconciliation_summary(
+    request: Request,
+    platform: Optional[str] = None,
+    month: Optional[str] = Query(None, description="YYYY-MM — filters on packed_on prefix"),
+):
+    """Summary counts of the funnel + reason breakdown for a month.
+
+    Query:
+      platform : filter by platform (defaults to all)
+      month    : "YYYY-MM" — filters online_order_items where packed_on
+                 starts with that prefix. Also matches the same prefix on
+                 return_creation_date + rto_creation_date + cancelled_on
+                 for row-level activity in that month.
+
+    Returns the same funnel counts as the import endpoint, but calculated
+    from the persisted online_order_items rather than the incoming file
+    (i.e. this is the read-side "here's the current state of the world").
+    """
+    await get_current_user(request)
+
+    q: Dict[str, Any] = {}
+    if platform: q["platform"] = platform.lower()
+    if month:
+        q["packed_on"] = {"$regex": f"^{month}"}
+
+    total_rows              = await db.online_order_items.count_documents(q)
+    packed                  = await db.online_order_items.count_documents({**q, "was_packed": True})
+    never_touched_inventory = await db.online_order_items.count_documents({**q, "never_touched_inventory": True})
+    returned_to_stock       = await db.online_order_items.count_documents({**q, "was_returned_to_stock": True})
+    pending                 = await db.online_order_items.count_documents({**q, "is_pending": True})
+    net_sold                = await db.online_order_items.count_documents({**q, "is_net_sold": True})
+
+    rto_c            = await db.online_order_items.count_documents({**q, "return_reason": "rto"})
+    customer_ret_c   = await db.online_order_items.count_documents({**q, "return_reason": "customer_return"})
+    cancel_pack_c    = await db.online_order_items.count_documents({**q, "return_reason": "cancelled_after_pack"})
+
+    return {
+        "platform": platform,
+        "month":    month,
+        "total_rows":              total_rows,
+        "packed":                  packed,
+        "never_touched_inventory": never_touched_inventory,
+        "returned_to_stock":       returned_to_stock,
+        "pending":                 pending,
+        "net_sold":                net_sold,
+        "reason_breakdown": {
+            "rto":                  rto_c,
+            "customer_return":      customer_ret_c,
+            "cancelled_after_pack": cancel_pack_c,
+        },
+    }
+
 
 
 
