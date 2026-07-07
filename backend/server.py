@@ -4416,9 +4416,35 @@ ORDER_CANONICAL_FIELDS = [
     "bin_barcode",
 ]
 
+# Canonical DISPATCH fields — what a "packed today" file from any platform
+# should be mapped into. Deliberately overlaps with order fields
+# (order_id / leaf_sku) so the same resolve_style() + split_leaf_sku()
+# pipeline runs against dispatch rows too.
+DISPATCH_CANONICAL_FIELDS = [
+    "order_id", "order_release_id",
+    "leaf_sku", "channel_sku",          # channel_sku = platform's own SKU code (e.g. Myntra SKU code)
+    "packed_on", "status",
+    "mrp", "selling_value",
+    "cgst", "sgst", "igst",
+    "tracking_id",
+    "destination_city", "destination_state", "destination_pincode",
+    "store_packet_id",
+    "product_title", "qty",             # qty defaults to 1 per row for dispatch files
+]
+
+# ConfigRole distinguishes ORDER/PICKLIST configs (used by the online-orders
+# importer) from DISPATCH configs (used by the daily "what got packed today"
+# importer). One platform can have BOTH — e.g. Myntra ships an OP-xxxxx.csv
+# picklist AND a Packed_order_data.csv dispatch file — so the collection's
+# uniqueness key is (platform, role), not platform alone.
+ConfigRole = Literal["order", "dispatch"]
+
 
 class OrderImportFormatConfigIn(BaseModel):
     platform: Platform
+    # "order" (default, backward-compatible) or "dispatch" — a single
+    # platform can have both. Immutable after creation.
+    role: ConfigRole = "order"
     sheet_locator: SheetLocator
     header_locator: HeaderLocator
     skip_rows_after_header: int = 0
@@ -4536,28 +4562,88 @@ DEFAULT_ORDER_IMPORT_CONFIGS = [
         "active": True,
         "notes": "Myntra picklist (OP-xxxxx.csv). No order_id — the filename (minus extension) is stored as picklist_batch_id. sellerSkuCode carries multiple naming variants; the doubled-L typo 'FLL_...' is REPLACED with 'FL_...' via known_sku_prefix_replacements (config-driven, no code change).",
     },
+    # ── Myntra Daily Dispatch (Packed_order_data.csv) ───────────────────
+    # Single clean-header CSV that Myntra emits daily. This is the record
+    # of what got PACKED that day — used to decrement ready_stock_qty and
+    # release any prior reservation. Distinct from the picklist above:
+    # picklist = "what to pull off the shelf next", dispatch = "what
+    # actually got packed and shipped".
+    {
+        "platform": "myntra",
+        "role": "dispatch",
+        "sheet_locator": {"type": "first_sheet"},
+        "header_locator": {"type": "fixed_row", "row": 0},
+        "skip_rows_after_header": 0,
+        "column_map": {
+            "order_id":            "Order id",
+            "order_release_id":    "Order_release_id",
+            "leaf_sku":            "Seller_sku_code",
+            "channel_sku":         "Myntra SKU code",
+            "packed_on":           "Packed On",
+            "status":              "Status",
+            "mrp":                 "MRP",
+            "selling_value":       "Selling value",
+            "cgst":                "CGST",
+            "sgst":                "SGST",
+            "igst":                "IGST",
+            "tracking_id":         "Tracking_id",
+            "destination_city":    "Destination City",
+            "destination_state":   "Destination state",
+            "destination_pincode": "Destination pincode",
+            "store_packet_id":     "Store Packet ID",
+        },
+        "known_sku_prefixes_to_strip": [],
+        "known_sku_prefix_replacements": {"FLL": "FL"},
+        "is_picklist": False,
+        "active": True,
+        "notes": "Myntra daily dispatch file (Packed_order_data.csv). Each row = 1 unit packed. Posts a 'dispatched' fg_stock_movement — implicit-reserve fallback covers first-time dispatches where no prior reservation exists. join key across all Myntra files: order_release_id + Seller_sku_code.",
+    },
 ]
 
 
 async def _seed_order_import_configs() -> int:
-    """Idempotently seed order_import_format_configs (Phase G).
+    """Idempotently seed order_import_format_configs (Phase G + Dispatch).
 
     Also performs an in-place UPGRADE on any pre-existing seeded config
     that pre-dates a schema addition — currently:
+      - backfills `role` = "order" on any legacy row that has no role
+      - migrates the uniqueness index from `platform` alone to
+        (`platform`, `role`) so a single platform can now hold both an
+        order/picklist config AND a dispatch config
       - adds `known_sku_prefix_replacements` (dict) if missing
       - migrates any "FLL" that was still living in `known_sku_prefixes_to_strip`
         (legacy Myntra seed) into `known_sku_prefix_replacements={FLL: FL}`.
     Non-seeded (user-created) configs are NEVER touched.
     """
+    # ── Step 1: backfill role on any legacy docs BEFORE creating the
+    # composite unique index (else the create_index would fail on
+    # duplicate (platform, null) keys).
+    await db.order_import_format_configs.update_many(
+        {"role": {"$exists": False}}, {"$set": {"role": "order"}}
+    )
+    # ── Step 2: drop the old platform-only unique index if it exists.
+    try:
+        idx_info = await db.order_import_format_configs.index_information()
+        if "oifc_platform_unique" in idx_info:
+            await db.order_import_format_configs.drop_index("oifc_platform_unique")
+            log.info("Order import registry: dropped legacy platform-only unique index")
+    except Exception as e:
+        log.warning(f"Could not inspect/drop legacy index: {e}")
+    # ── Step 3: create the composite (platform, role) unique index.
     try:
         await db.order_import_format_configs.create_index(
-            "platform", unique=True, name="oifc_platform_unique",
+            [("platform", 1), ("role", 1)],
+            unique=True, name="oifc_platform_role_unique",
         )
     except Exception as e:
-        log.warning(f"Could not create order_import_format_configs index: {e}")
+        log.warning(f"Could not create order_import_format_configs composite index: {e}")
+    # ── Step 4: seed / upgrade the default configs.
     inserted = 0
     for cfg in DEFAULT_ORDER_IMPORT_CONFIGS:
-        existing = await db.order_import_format_configs.find_one({"platform": cfg["platform"]})
+        cfg_role = cfg.get("role") or "order"
+        existing = await db.order_import_format_configs.find_one(
+            {"platform": cfg["platform"], "role": cfg_role}
+        )
         if existing:
             # Upgrade path for seeded configs: reconcile with current default
             # if this row was originally seeded (never touch user-created rows).
@@ -4565,9 +4651,9 @@ async def _seed_order_import_configs() -> int:
                 upd: Dict[str, Any] = {}
                 if "known_sku_prefix_replacements" not in existing:
                     upd["known_sku_prefix_replacements"] = cfg.get("known_sku_prefix_replacements") or {}
-                # Legacy Myntra: FLL was mis-classified as a strip prefix; move it.
+                # Legacy Myntra order-config: FLL was mis-classified as a strip prefix; move it.
                 strip_list = list(existing.get("known_sku_prefixes_to_strip") or [])
-                if cfg["platform"] == "myntra" and "FLL" in strip_list:
+                if cfg["platform"] == "myntra" and cfg_role == "order" and "FLL" in strip_list:
                     strip_list = [p for p in strip_list if p != "FLL"]
                     upd["known_sku_prefixes_to_strip"] = strip_list
                     reps = dict(existing.get("known_sku_prefix_replacements") or {})
@@ -4577,11 +4663,12 @@ async def _seed_order_import_configs() -> int:
                 if upd:
                     upd["updated_at"] = now_iso()
                     await db.order_import_format_configs.update_one(
-                        {"platform": cfg["platform"]}, {"$set": upd}
+                        {"platform": cfg["platform"], "role": cfg_role}, {"$set": upd}
                     )
-                    log.info(f"Order import registry: upgraded seeded config for {cfg['platform']}: {list(upd.keys())}")
+                    log.info(f"Order import registry: upgraded seeded config for {cfg['platform']}/{cfg_role}: {list(upd.keys())}")
             continue
         doc = dict(cfg)
+        doc["role"]       = cfg_role
         doc["created_at"] = now_iso()
         doc["updated_at"] = now_iso()
         doc["seeded"]     = True
@@ -4791,61 +4878,88 @@ def _read_workbook_or_csv(content: bytes, filename: str):
 
 # ── Endpoints (CRUD) ─────────────────────────────────────────────────
 @api.get("/order-import-format-configs")
-async def list_order_import_configs(request: Request, active: Optional[bool] = None):
+async def list_order_import_configs(
+    request: Request,
+    active: Optional[bool] = None,
+    role: Optional[str] = None,
+):
     await get_current_user(request)
     q: Dict[str, Any] = {}
     if active is not None: q["active"] = active
+    if role is not None:   q["role"]   = role
     docs = await db.order_import_format_configs.find(q).sort("platform", 1).to_list(1000)
     return [stringify(d) for d in docs]
 
 
 @api.get("/order-import-format-configs/_meta/canonical-fields")
-async def get_order_canonical_fields(request: Request):
+async def get_order_canonical_fields(request: Request, role: str = "order"):
     await get_current_user(request)
-    return {"canonical_fields": ORDER_CANONICAL_FIELDS}
+    if role == "dispatch":
+        return {"role": "dispatch", "canonical_fields": DISPATCH_CANONICAL_FIELDS}
+    return {"role": "order", "canonical_fields": ORDER_CANONICAL_FIELDS}
 
 
 @api.get("/order-import-format-configs/{platform}")
-async def get_order_import_config(platform: str, request: Request):
+async def get_order_import_config(platform: str, request: Request, role: str = "order"):
     await get_current_user(request)
-    doc = await db.order_import_format_configs.find_one({"platform": platform.lower()})
+    doc = await db.order_import_format_configs.find_one(
+        {"platform": platform.lower(), "role": role}
+    )
     if not doc:
-        raise HTTPException(404, f"No order-import config for platform '{platform}'")
+        raise HTTPException(404, f"No {role}-import config for platform '{platform}'")
     return stringify(doc)
 
 
 @api.post("/order-import-format-configs")
 async def create_order_import_config(payload: OrderImportFormatConfigIn, request: Request):
     u = await get_current_user(request); require_roles("admin")(u)
-    if await db.order_import_format_configs.find_one({"platform": payload.platform}):
-        raise HTTPException(409, f"Config for platform '{payload.platform}' already exists — use PUT to update")
+    if await db.order_import_format_configs.find_one(
+        {"platform": payload.platform, "role": payload.role}
+    ):
+        raise HTTPException(
+            409,
+            f"Config for platform '{payload.platform}' role '{payload.role}' already exists — use PUT to update"
+        )
     doc = payload.model_dump()
     doc["created_at"] = now_iso(); doc["updated_at"] = now_iso(); doc["seeded"] = False
     try:
         res = await db.order_import_format_configs.insert_one(doc)
     except DuplicateKeyError:
-        raise HTTPException(409, f"Config for platform '{payload.platform}' already exists")
+        raise HTTPException(409, f"Config for platform '{payload.platform}' role '{payload.role}' already exists")
     doc.pop("_id", None); doc["id"] = str(res.inserted_id)
     await log_activity("order_import_format.create", "order_import_format_configs",
-                       f"Added order-import config for {payload.platform}", u["email"])
+                       f"Added {payload.role}-import config for {payload.platform}", u["email"])
     return doc
 
 
 @api.put("/order-import-format-configs/{platform}")
-async def update_order_import_config(platform: str, payload: OrderImportFormatConfigUpdate, request: Request):
+async def update_order_import_config(
+    platform: str,
+    payload: OrderImportFormatConfigUpdate,
+    request: Request,
+    role: str = "order",
+):
     u = await get_current_user(request); require_roles("admin")(u)
     platform_lc = platform.lower()
-    existing = await db.order_import_format_configs.find_one({"platform": platform_lc})
+    existing = await db.order_import_format_configs.find_one(
+        {"platform": platform_lc, "role": role}
+    )
     if not existing:
-        raise HTTPException(404, f"No order-import config for platform '{platform_lc}'")
+        raise HTTPException(404, f"No {role}-import config for platform '{platform_lc}'")
     update: Dict[str, Any] = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
+    # role is immutable — reject any attempt to change it
+    update.pop("role", None)
     if not update:
         return stringify(existing)
     update["updated_at"] = now_iso()
-    await db.order_import_format_configs.update_one({"platform": platform_lc}, {"$set": update})
-    fresh = await db.order_import_format_configs.find_one({"platform": platform_lc})
+    await db.order_import_format_configs.update_one(
+        {"platform": platform_lc, "role": role}, {"$set": update}
+    )
+    fresh = await db.order_import_format_configs.find_one(
+        {"platform": platform_lc, "role": role}
+    )
     await log_activity("order_import_format.update", "order_import_format_configs",
-                       f"Updated order-import config for {platform_lc}: {', '.join(update.keys())}", u["email"])
+                       f"Updated {role}-import config for {platform_lc}: {', '.join(update.keys())}", u["email"])
     return stringify(fresh)
 
 
@@ -4980,7 +5094,9 @@ async def import_online_orders_configured(
     u = await get_current_user(request); require_roles("admin", "manager")(u)
 
     platform_lc = (platform or "").strip().lower()
-    cfg_doc = await db.order_import_format_configs.find_one({"platform": platform_lc})
+    cfg_doc = await db.order_import_format_configs.find_one(
+        {"platform": platform_lc, "role": "order"}
+    )
     if not cfg_doc:
         raise HTTPException(
             400,
