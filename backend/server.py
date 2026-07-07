@@ -3528,6 +3528,75 @@ CANONICAL_FIELDS = [
 ]
 
 
+# ── Export template value sources (Phase F) ──────────────────────────
+# Each column in an export_template.columns row declares how to fill in
+# its per-row cell value. The resolver walks these sources for each
+# {colour × size} combination the caller has selected. New source types
+# can be added later by extending _resolve_export_source() below.
+EXPORT_SOURCE_TYPES = [
+    "group_sku",      # build_catalogue_sku(style_code, color_code)
+    "leaf_sku",       # build_catalogue_sku(style_code, color_code, size)
+    "style_code",     # the SSK_XXXXX itself
+    "size",           # the size string
+    "color_name",     # the colour name (e.g. "Tan")
+    "color_code",     # the 2-3 letter code (e.g. "TN")
+    "style",          # a dot-path field on the Style master     ("style", key="name")
+    "lifecycle",      # a dot-path field on style_lifecycle       ("lifecycle", key="mrp")
+    "constant",       # a fixed value from `value`
+    "blank",          # empty — platform will assign (e.g. Myntra Style Id)
+]
+
+
+class ExportColumn(BaseModel):
+    """One column in a platform's new-listing upload file."""
+    name: str                                 # exact header text the platform requires
+    source: Literal[
+        "group_sku", "leaf_sku", "style_code", "size",
+        "color_name", "color_code",
+        "style", "lifecycle", "constant", "blank",
+    ]
+    # For source="style" or "lifecycle" — which field on that doc to pull.
+    # e.g. source="style", key="name" → style.name
+    key: Optional[str] = None
+    # For source="constant" — the literal value to emit for every row.
+    value: Optional[Any] = None
+    # For source="blank" only — an optional hint shown in the UI.
+    notes: Optional[str] = None
+    required: bool = False
+
+
+class ExportTemplate(BaseModel):
+    """Structure of the new-listing upload file for one platform."""
+    sheet_name: str = "Sheet1"
+    # 0-based row index at which the header row is written. Anything before
+    # this is filled with pre_header_rows (list of lists) as literal cells.
+    header_row_index: int = 0
+    # Filler rows placed BEFORE the header (Ajio ships a couple of
+    # blank/metadata rows at the top of its template).
+    pre_header_rows: Optional[List[List[Any]]] = None
+    # Filler rows placed AFTER the header, BEFORE the first data row
+    # (Flipkart's "hint / max chars" row).
+    post_header_rows: Optional[List[List[Any]]] = None
+    columns: List[ExportColumn]
+
+    @field_validator("columns")
+    @classmethod
+    def _cols_non_empty(cls, v):
+        if not v or len(v) == 0:
+            raise PydanticCustomError(
+                "export_columns_empty",
+                "export_template.columns must contain at least one column"
+            )
+        # Ensure at least one column is source=leaf_sku — a listing file
+        # without a leaf SKU cannot be re-imported later without ambiguity.
+        if not any(c.source == "leaf_sku" for c in v):
+            raise PydanticCustomError(
+                "export_columns_leaf_sku",
+                "export_template.columns must include exactly one column with source='leaf_sku'"
+            )
+        return v
+
+
 class SheetLocator(BaseModel):
     """How to find the data sheet within an uploaded workbook."""
     type: Literal["fixed_name", "name_contains", "first_sheet"]
@@ -3568,6 +3637,10 @@ class ListingFormatConfigIn(BaseModel):
     has_native_group_id: bool = False
     active: bool = True
     notes: Optional[str] = ""
+    # NEW (Phase F): structure of the new-listing upload file. Optional so
+    # existing configs don't break; catalogue-export refuses to run for a
+    # platform whose export_template is null with a clear error.
+    export_template: Optional[ExportTemplate] = None
 
     @field_validator("column_map")
     @classmethod
@@ -3592,6 +3665,7 @@ class ListingFormatConfigUpdate(BaseModel):
     has_native_group_id: Optional[bool] = None
     active: Optional[bool] = None
     notes: Optional[str] = None
+    export_template: Optional[ExportTemplate] = None
 
     @field_validator("column_map")
     @classmethod
@@ -3634,6 +3708,28 @@ DEFAULT_LISTING_FORMAT_CONFIGS = [
         "has_native_group_id": True,
         "active": True,
         "notes": "Myntra Style Dashboard export. Sheet name is fixed. Size is embedded in SellerSkuCode.",
+        # Phase F — new-listing upload template. Myntra assigns its numeric
+        # Style Id post-ingest, so we leave that column blank. Our own leaf
+        # SKU (SSK_XXXXX-COLOR-SIZE) sits in the SellerSkuCode column,
+        # which is what Myntra echoes back on every subsequent export.
+        "export_template": {
+            "sheet_name": "styledashboard",
+            "header_row_index": 0,
+            "columns": [
+                {"name": "Style Id",       "source": "blank",     "notes": "Myntra assigns after ingest"},
+                {"name": "SellerSkuCode",  "source": "leaf_sku",  "required": True},
+                {"name": "Style Name",     "source": "style",     "key": "name"},
+                {"name": "Brand",          "source": "lifecycle", "key": "brand"},
+                {"name": "Category",       "source": "style",     "key": "category"},
+                {"name": "Colour",         "source": "color_name"},
+                {"name": "Size",           "source": "size"},
+                {"name": "MRP",            "source": "lifecycle", "key": "mrp"},
+                {"name": "Selling Price",  "source": "lifecycle", "key": "online_selling_price"},
+                {"name": "Description",    "source": "style",     "key": "description"},
+                {"name": "Image URL",      "source": "style",     "key": "image_url"},
+                {"name": "Listing Status", "source": "constant",  "value": "Active"},
+            ],
+        },
     },
     # ── Ajio ──────────────────────────────────────────────────────────
     # Sheet name is dynamic per feed/category (e.g. "Women_Styles_20250701"),
@@ -3661,6 +3757,32 @@ DEFAULT_LISTING_FORMAT_CONFIGS = [
         "has_native_group_id": True,
         "active": True,
         "notes": "Ajio catalogue export. Sheet name pattern *_Styles_*. Header row may shift — scanner handles rows 0-10.",
+        # Phase F — Ajio's new-listing template. Header is on row index 2,
+        # with two filler/metadata rows above. Ajio uses OUR group_sku for
+        # *Style Code and OUR leaf_sku for *Item SKU — they don't reassign.
+        "export_template": {
+            "sheet_name": "SSK_Styles_Export",
+            "header_row_index": 2,
+            "pre_header_rows": [
+                ["SSK Footcare — new listing upload"],
+                ["Generated automatically. Do not edit header row."],
+            ],
+            "columns": [
+                {"name": "*Style Code",           "source": "group_sku",  "required": True},
+                {"name": "*Style Description",   "source": "style",      "key": "description"},
+                {"name": "*Item SKU",            "source": "leaf_sku",   "required": True},
+                {"name": "*Brand",               "source": "lifecycle",  "key": "brand"},
+                {"name": "*MRP",                 "source": "lifecycle",  "key": "mrp"},
+                {"name": "*Size",                "source": "size",       "required": True},
+                {"name": "*Primary Color",       "source": "color_name", "required": True},
+                {"name": "*Color Family",        "source": "lifecycle",  "key": "color_family"},
+                {"name": "*Upper Material",      "source": "lifecycle",  "key": "upper_material"},
+                {"name": "*Sole Material",       "source": "lifecycle",  "key": "sole_material"},
+                {"name": "*Product Description", "source": "style",      "key": "description"},
+                {"name": "*Selling Price",       "source": "lifecycle",  "key": "online_selling_price"},
+                {"name": "*Listing Status",      "source": "constant",   "value": "Active"},
+            ],
+        },
     },
     # ── Flipkart ──────────────────────────────────────────────────────
     # Simple single-sheet format; take first sheet. Header on row 0, then
@@ -3688,20 +3810,68 @@ DEFAULT_LISTING_FORMAT_CONFIGS = [
         "has_native_group_id": False,
         "active": True,
         "notes": "Flipkart Listings export. Row 1 (after header) is a description/hint row and must be skipped. No native group id — derive via SKU map.",
+        # Phase F — Flipkart's new-listing template. No native group id
+        # column, so we emit only the leaf SKU (SSK_XXXXX-COLOR-SIZE) and
+        # rely on the SKU map to reassemble the group later. Flipkart's
+        # template includes a hint/example row right below the header.
+        "export_template": {
+            "sheet_name": "Listings",
+            "header_row_index": 0,
+            "post_header_rows": [
+                [
+                    "Seller SKU Id (must be unique per size)",
+                    "Full product title (max 200 chars)",
+                    "Brand name", "MRP (INR)", "Your selling price (INR)",
+                    "Colour name", "Size (numeric)", "Product description",
+                    "Public image URL", "Active",
+                ],
+            ],
+            "columns": [
+                {"name": "Seller SKU Id",     "source": "leaf_sku",   "required": True},
+                {"name": "Product Title",    "source": "style",      "key": "name"},
+                {"name": "Brand",            "source": "lifecycle",  "key": "brand"},
+                {"name": "MRP",              "source": "lifecycle",  "key": "mrp"},
+                {"name": "Your Selling Price","source": "lifecycle", "key": "online_selling_price"},
+                {"name": "Color",            "source": "color_name"},
+                {"name": "Size",             "source": "size"},
+                {"name": "Description",      "source": "style",      "key": "description"},
+                {"name": "Image URL",        "source": "style",      "key": "image_url"},
+                {"name": "Listing Status",   "source": "constant",   "value": "Active"},
+            ],
+        },
     },
 ]
 
 
 async def _seed_listing_format_configs() -> int:
-    """Idempotently seed listing_format_configs with Myntra/Ajio/Flipkart."""
+    """Idempotently seed listing_format_configs with Myntra/Ajio/Flipkart.
+
+    Also patches previously-seeded docs that were created BEFORE the
+    export_template field existed (Phase F) — so a live deployment picks
+    up the new export template on next restart without needing a manual
+    Mongo migration or a DELETE-and-reseed dance.
+    """
     try:
         await db.listing_format_configs.create_index("platform", unique=True, name="lfc_platform_unique")
     except Exception as e:
         log.warning(f"Could not create listing_format_configs index: {e}")
     inserted = 0
+    patched = 0
     for cfg in DEFAULT_LISTING_FORMAT_CONFIGS:
         existing = await db.listing_format_configs.find_one({"platform": cfg["platform"]})
         if existing:
+            # If the existing seeded doc is missing export_template, patch it.
+            # Do NOT touch admin-edited docs (seeded=False) or configs whose
+            # export_template has already been customised.
+            if existing.get("seeded", False) and not existing.get("export_template") and cfg.get("export_template"):
+                await db.listing_format_configs.update_one(
+                    {"platform": cfg["platform"]},
+                    {"$set": {
+                        "export_template": cfg["export_template"],
+                        "updated_at":      now_iso(),
+                    }},
+                )
+                patched += 1
             continue
         doc = dict(cfg)
         doc["created_at"] = now_iso()
@@ -3709,6 +3879,8 @@ async def _seed_listing_format_configs() -> int:
         doc["seeded"]     = True
         await db.listing_format_configs.insert_one(doc)
         inserted += 1
+    if patched:
+        log.info(f"Listing format registry: patched {patched} seeded configs with export_template")
     return inserted
 
 
@@ -3781,6 +3953,376 @@ async def get_canonical_fields(request: Request):
     admin UI render an editable form without hardcoding the schema client-side."""
     await get_current_user(request)
     return {"canonical_fields": CANONICAL_FIELDS}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ══ CATALOGUE EXPORT GENERATOR (Phase F) ═══════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Build the actual file a merchandiser uploads to a platform's seller
+# panel to catalogue a NEW style. This closes the loop:
+#   Style created → SSK_XXXXX assigned (Phase A0)
+#   → catalogue file generated here with our own SKU naming
+#   → uploaded to platform → platform's own export later re-imported
+#   → matches on the SSK pattern directly with zero manual reconciliation.
+# ═══════════════════════════════════════════════════════════════════════
+
+class CatalogueExportRequest(BaseModel):
+    style_id: str
+    platform: Platform
+    # Colours & sizes the merchandiser wants to catalogue in this file.
+    # If omitted or empty, defaults to lifecycle.planned_colors / planned_sizes.
+    colors: Optional[List[str]] = None
+    sizes:  Optional[List[str]] = None
+
+
+def _resolve_export_source(
+    col: dict,
+    *,
+    style: dict,
+    lifecycle: Optional[dict],
+    style_code: str,
+    color_name: str,
+    color_code: str,
+    size: str,
+) -> Any:
+    """Resolve one export-template column's cell value for one row.
+
+    Kept small and pure — new source types are added by extending this
+    switch, no other code path changes.
+    """
+    src = col.get("source")
+    if src == "blank":
+        return ""
+    if src == "constant":
+        return col.get("value", "")
+    if src == "group_sku":
+        return build_catalogue_sku(style_code, color_code)
+    if src == "leaf_sku":
+        return build_catalogue_sku(style_code, color_code, size)
+    if src == "style_code":
+        return style_code
+    if src == "size":
+        return size
+    if src == "color_name":
+        return color_name
+    if src == "color_code":
+        return color_code
+    if src == "style":
+        key = col.get("key")
+        if not key:
+            return ""
+        return style.get(key, "") if isinstance(style, dict) else ""
+    if src == "lifecycle":
+        key = col.get("key")
+        if not key or not lifecycle:
+            return ""
+        return lifecycle.get(key, "")
+    return ""
+
+
+async def _upsert_provisional_sku_map(
+    *,
+    style_id: str,
+    platform: str,
+    group_sku: str,
+    color_name: str,
+    sizes_covered: List[str],
+    user_email: str,
+) -> str:
+    """Insert (or refresh) a provisional sku_map row for this
+    (style_id, platform, group_sku). Status is
+    'pending_platform_confirmation' — flipped to 'confirmed' later either
+    manually via the SKU-map UI or automatically when the first
+    online_orders import (Phase 4 of the master plan) resolves this exact
+    external_sku successfully.
+
+    Returns "created" | "updated" | "unchanged" so the caller can report.
+    """
+    filter_ = {
+        "source_type":  "online_channel",
+        "source_name":  platform,
+        "external_sku": group_sku,
+    }
+    existing = await db.sku_map.find_one(filter_)
+    color_map = {color_name: color_name}   # identity — colour name matches on both sides
+    size_map  = {s: str(s) for s in sizes_covered}
+    if existing:
+        # Only touch fields we own; never downgrade a confirmed mapping.
+        update: Dict[str, Any] = {}
+        if existing.get("style_id") != style_id:
+            update["style_id"] = style_id
+        # Merge maps — additive
+        merged_cm = {**(existing.get("color_map") or {}), **color_map}
+        merged_sm = {**(existing.get("size_map")  or {}), **size_map}
+        if merged_cm != (existing.get("color_map") or {}):
+            update["color_map"] = merged_cm
+        if merged_sm != (existing.get("size_map") or {}):
+            update["size_map"] = merged_sm
+        # Only touch status if it's not already confirmed
+        if existing.get("status") not in ("confirmed", "auto_confirmed"):
+            update["status"] = "pending_platform_confirmation"
+        if not update:
+            return "unchanged"
+        update["updated_at"] = now_iso()
+        await db.sku_map.update_one({"_id": existing["_id"]}, {"$set": update})
+        return "updated"
+    doc = {
+        "style_id":            style_id,
+        "source_type":         "online_channel",
+        "source_name":         platform,
+        "external_sku":        group_sku,
+        "external_style_name": "",
+        "color_map":           color_map,
+        "size_map":            size_map,
+        "status":              "pending_platform_confirmation",
+        "created_via":         "catalogue_export",
+        "created_at":          now_iso(),
+        "updated_at":          now_iso(),
+    }
+    try:
+        await db.sku_map.insert_one(doc)
+        return "created"
+    except DuplicateKeyError:
+        # Race — another concurrent export inserted first. Treat as updated.
+        return "updated"
+
+
+@api.post("/catalogue-export")
+async def catalogue_export(payload: CatalogueExportRequest, request: Request):
+    """Generate a new-listing upload .xlsx for one style × platform.
+
+    For each (colour, size) combination:
+      - color_code   = color_master lookup for colour name
+      - group_sku    = build_catalogue_sku(style_code, color_code)
+      - leaf_sku     = build_catalogue_sku(style_code, color_code, size)
+    Rows populate the platform's export_template.columns in declared order.
+    Also inserts/refreshes provisional sku_map rows for each (colour, group_sku)
+    pair (status="pending_platform_confirmation").
+    Returns application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.
+    """
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+
+    # 1. Style + config lookups
+    style = await db.styles.find_one({"_id": oid(payload.style_id)})
+    if not style:
+        raise HTTPException(404, "Style not found")
+    style_code = style.get("code", "")
+    if not style_code:
+        raise HTTPException(400, "Style has no style_code — cannot export a catalogue file")
+
+    cfg = await db.listing_format_configs.find_one({"platform": payload.platform})
+    if not cfg:
+        raise HTTPException(404, f"No listing-format config for platform '{payload.platform}' — create one first")
+    export_template = cfg.get("export_template")
+    if not export_template:
+        raise HTTPException(
+            400,
+            f"Platform '{payload.platform}' has no export_template configured. "
+            "Add one via PUT /api/listing-format-configs/{platform} before generating catalogue files."
+        )
+    if not cfg.get("active", True):
+        raise HTTPException(400, f"Platform '{payload.platform}' config is inactive")
+
+    lifecycle = await db.style_lifecycle.find_one({"style_id": str(style["_id"])})
+
+    # 2. Resolve which colours × sizes to export
+    colors = [c for c in (payload.colors or []) if c and c.strip()]
+    sizes  = [str(s) for s in (payload.sizes  or []) if s and str(s).strip()]
+    if not colors and lifecycle:
+        colors = [c for c in (lifecycle.get("planned_colors") or []) if c]
+    if not sizes and lifecycle:
+        sizes = [str(s) for s in (lifecycle.get("planned_sizes") or []) if s]
+    if not colors:
+        raise HTTPException(400, "No colours to export. Pass `colors` in the body or set lifecycle.planned_colors.")
+    if not sizes:
+        raise HTTPException(400, "No sizes to export. Pass `sizes` in the body or set lifecycle.planned_sizes.")
+
+    # 3. Resolve colour_code for each colour. Refuse to export if any is
+    # unmapped — silently emitting a blank primary-colour code would poison
+    # every downstream marketplace reconciliation.
+    color_rows: List[Dict[str, str]] = []
+    unmapped: List[str] = []
+    for cname in colors:
+        cc = await resolve_color_code(cname)
+        if not cc:
+            unmapped.append(cname)
+        else:
+            color_rows.append({"color_name": cname, "color_code": cc})
+    if unmapped:
+        raise HTTPException(
+            400,
+            f"These colours are not in the color master: {', '.join(unmapped)}. "
+            "Add them via POST /api/color-master before exporting."
+        )
+
+    # 4. Build the workbook
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (export_template.get("sheet_name") or "Sheet1")[:31]  # Excel sheet-name limit
+
+    columns: List[dict] = export_template.get("columns") or []
+    if not columns:
+        raise HTTPException(500, "export_template.columns is empty — refusing to write an empty file")
+    header_row_index = int(export_template.get("header_row_index") or 0)   # 0-based
+    pre_header_rows  = export_template.get("pre_header_rows")  or []
+    post_header_rows = export_template.get("post_header_rows") or []
+
+    # Pre-header filler
+    row_cursor = 1   # openpyxl is 1-indexed
+    for filler in pre_header_rows:
+        for i, cell in enumerate(filler):
+            ws.cell(row=row_cursor, column=i + 1, value=cell)
+        row_cursor += 1
+    # If header_row_index > pre_header_rows length, pad with blank rows
+    target_header_row = header_row_index + 1   # convert 0-based → 1-based
+    while row_cursor < target_header_row:
+        row_cursor += 1
+
+    # Header
+    for i, col in enumerate(columns):
+        ws.cell(row=row_cursor, column=i + 1, value=col.get("name", ""))
+    row_cursor += 1
+
+    # Post-header filler
+    for filler in post_header_rows:
+        for i, cell in enumerate(filler):
+            ws.cell(row=row_cursor, column=i + 1, value=cell)
+        row_cursor += 1
+
+    # Data rows — colour × size Cartesian product, colour-major so all rows
+    # for one colour sit together (matches how merchandisers eyeball listings).
+    rows_written = 0
+    sku_map_summary = {"created": 0, "updated": 0, "unchanged": 0}
+    style_dict = stringify(style)
+    lifecycle_dict = stringify(lifecycle) if lifecycle else None
+
+    for cr in color_rows:
+        group_sku = build_catalogue_sku(style_code, cr["color_code"])
+        for sz in sizes:
+            for i, col in enumerate(columns):
+                val = _resolve_export_source(
+                    col,
+                    style=style_dict,
+                    lifecycle=lifecycle_dict,
+                    style_code=style_code,
+                    color_name=cr["color_name"],
+                    color_code=cr["color_code"],
+                    size=sz,
+                )
+                ws.cell(row=row_cursor, column=i + 1, value=val)
+            row_cursor += 1
+            rows_written += 1
+
+        # Provisional sku_map row per (colour, platform) — one entry per
+        # group SKU, not one per size, matching how sku_map is keyed in Phase 1.
+        outcome = await _upsert_provisional_sku_map(
+            style_id=str(style["_id"]),
+            platform=payload.platform,
+            group_sku=group_sku,
+            color_name=cr["color_name"],
+            sizes_covered=sizes,
+            user_email=u["email"],
+        )
+        sku_map_summary[outcome] = sku_map_summary.get(outcome, 0) + 1
+
+    # 5. Return as downloadable stream
+    import io  # local, matches project convention (already used elsewhere)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    await log_activity(
+        "catalogue.export",
+        "catalogue_export",
+        f"Generated {payload.platform} listing file for style {style_code} "
+        f"({len(color_rows)} colours × {len(sizes)} sizes = {rows_written} rows; "
+        f"sku_map: {sku_map_summary})",
+        u["email"],
+    )
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"{style_code}_{payload.platform}_listing_{ts}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # Custom headers so the frontend can show a toast without needing
+            # to re-fetch or parse the file body.
+            "X-Style-Code":         style_code,
+            "X-Rows-Written":       str(rows_written),
+            "X-Colors":             str(len(color_rows)),
+            "X-Sizes":              str(len(sizes)),
+            "X-SkuMap-Created":     str(sku_map_summary.get("created", 0)),
+            "X-SkuMap-Updated":     str(sku_map_summary.get("updated", 0)),
+            "X-SkuMap-Unchanged":   str(sku_map_summary.get("unchanged", 0)),
+            "Access-Control-Expose-Headers":
+                "Content-Disposition, X-Style-Code, X-Rows-Written, X-Colors, "
+                "X-Sizes, X-SkuMap-Created, X-SkuMap-Updated, X-SkuMap-Unchanged",
+        },
+    )
+
+
+@api.post("/catalogue-export/preview")
+async def catalogue_export_preview(payload: CatalogueExportRequest, request: Request):
+    """Non-file preview endpoint — returns the same rows the .xlsx would
+    contain, as JSON. Used by the frontend to show a preview table before
+    the user hits Download. Does NOT insert sku_map rows."""
+    await get_current_user(request)
+
+    style = await db.styles.find_one({"_id": oid(payload.style_id)})
+    if not style:
+        raise HTTPException(404, "Style not found")
+    style_code = style.get("code", "")
+    cfg = await db.listing_format_configs.find_one({"platform": payload.platform})
+    if not cfg:
+        raise HTTPException(404, f"No listing-format config for platform '{payload.platform}'")
+    export_template = cfg.get("export_template")
+    if not export_template:
+        raise HTTPException(400, f"Platform '{payload.platform}' has no export_template configured")
+
+    lifecycle = await db.style_lifecycle.find_one({"style_id": str(style["_id"])})
+    colors = [c for c in (payload.colors or []) if c and c.strip()]
+    sizes  = [str(s) for s in (payload.sizes  or []) if s and str(s).strip()]
+    if not colors and lifecycle: colors = [c for c in (lifecycle.get("planned_colors") or []) if c]
+    if not sizes  and lifecycle: sizes  = [str(s) for s in (lifecycle.get("planned_sizes")  or []) if s]
+
+    color_rows, unmapped = [], []
+    for cname in colors:
+        cc = await resolve_color_code(cname)
+        (unmapped if not cc else color_rows).append({"color_name": cname, "color_code": cc} if cc else cname)
+
+    style_dict = stringify(style)
+    lifecycle_dict = stringify(lifecycle) if lifecycle else None
+    columns = export_template.get("columns") or []
+    header  = [c.get("name", "") for c in columns]
+    rows    = []
+    for cr in color_rows:
+        for sz in sizes:
+            row = []
+            for col in columns:
+                row.append(_resolve_export_source(
+                    col,
+                    style=style_dict, lifecycle=lifecycle_dict,
+                    style_code=style_code,
+                    color_name=cr["color_name"], color_code=cr["color_code"],
+                    size=sz,
+                ))
+            rows.append(row)
+
+    return {
+        "style_code":       style_code,
+        "platform":         payload.platform,
+        "sheet_name":       export_template.get("sheet_name"),
+        "header_row_index": export_template.get("header_row_index", 0),
+        "header":           header,
+        "rows":             rows,
+        "row_count":        len(rows),
+        "colors":           [cr["color_name"] for cr in color_rows],
+        "sizes":            sizes,
+        "unmapped_colors":  unmapped,
+    }
 
 
 # ---------- COSTING (live preview) ----------

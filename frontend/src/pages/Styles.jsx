@@ -18,6 +18,7 @@ import {
   Save,
   Calculator as CalcIcon,
   Upload,
+  Download,
   ArrowLeftRight,
 } from "lucide-react";
 
@@ -79,6 +80,15 @@ export default function Styles() {
   // Catalogue codes for the currently-open style (group SKU + leaf SKUs)
   const [catalogueCodes, setCatalogueCodes] = useState(null);
   const [catalogueLoading, setCatalogueLoading] = useState(false);
+  // Catalogue export modal state (Phase F)
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportPlatform, setExportPlatform] = useState("myntra");
+  const [exportColors, setExportColors] = useState([]);          // selected colour names
+  const [exportSizes, setExportSizes] = useState([]);            // selected size strings
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [exportPreview, setExportPreview] = useState(null);      // response from /catalogue-export/preview
+  const [exportPlatformsAvailable, setExportPlatformsAvailable] = useState([]);
 
   const loadCatalogueCodes = async (styleId) => {
     if (!styleId) return;
@@ -91,6 +101,106 @@ export default function Styles() {
       setCatalogueCodes(null);
     } finally {
       setCatalogueLoading(false);
+    }
+  };
+
+  // Open the export modal, pre-selecting all colours & sizes and loading
+  // the list of platforms that have an export_template configured.
+  const openExportModal = async (platform) => {
+    if (!catalogueCodes) return;
+    setExportError("");
+    setExportPreview(null);
+    setExportPlatform(platform);
+    setExportColors(catalogueCodes.colors || []);
+    setExportSizes(catalogueCodes.sizes || []);
+    setExportOpen(true);
+    // Fetch available platforms once (cached in state)
+    if (exportPlatformsAvailable.length === 0) {
+      try {
+        const r = await http.get("/listing-format-configs?active=true");
+        setExportPlatformsAvailable(
+          (r.data || []).filter((c) => !!c.export_template),
+        );
+      } catch (e) {
+        console.error("Failed to load listing format configs", e);
+      }
+    }
+  };
+
+  const toggleColor = (c) =>
+    setExportColors((prev) => (prev.includes(c) ? prev.filter((x) => x !== c) : [...prev, c]));
+  const toggleSize = (s) =>
+    setExportSizes((prev) => (prev.includes(s) ? prev.filter((x) => x !== s) : [...prev, s]));
+
+  const runExportPreview = async () => {
+    setExportBusy(true);
+    setExportError("");
+    setExportPreview(null);
+    try {
+      const res = await http.post("/catalogue-export/preview", {
+        style_id: editId,
+        platform: exportPlatform,
+        colors: exportColors,
+        sizes: exportSizes,
+      });
+      setExportPreview(res.data);
+    } catch (e) {
+      setExportError(e.response?.data?.detail || e.message);
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  // Download the .xlsx directly. We keep this separate from preview so the
+  // sku_map provisional rows are only created when the user really commits.
+  const downloadExport = async () => {
+    setExportBusy(true);
+    setExportError("");
+    try {
+      const res = await http.post(
+        "/catalogue-export",
+        {
+          style_id: editId,
+          platform: exportPlatform,
+          colors: exportColors,
+          sizes: exportSizes,
+        },
+        { responseType: "blob" },
+      );
+      // Filename from Content-Disposition
+      const cd = res.headers["content-disposition"] || "";
+      const m = /filename="([^"]+)"/.exec(cd);
+      const fname = m ? m[1] : `${exportPlatform}_listing.xlsx`;
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      // Show quick summary from response headers
+      const rows = res.headers["x-rows-written"];
+      const created = res.headers["x-skumap-created"];
+      const updated = res.headers["x-skumap-updated"];
+      setExportError(
+        `Downloaded ${fname} — ${rows} rows written, ${created || 0} new SKU-map rows (${updated || 0} updated). Provisional status: pending platform confirmation.`,
+      );
+    } catch (e) {
+      // Blob error responses need to be text-decoded
+      if (e.response?.data instanceof Blob) {
+        const txt = await e.response.data.text();
+        try {
+          const j = JSON.parse(txt);
+          setExportError(j.detail || txt);
+        } catch {
+          setExportError(txt);
+        }
+      } else {
+        setExportError(e.response?.data?.detail || e.message);
+      }
+    } finally {
+      setExportBusy(false);
     }
   };
   const [newMapping, setNewMapping] = useState({
@@ -991,18 +1101,40 @@ export default function Styles() {
               {/* Catalogue Codes — SSK-generated marketplace SKUs */}
               {editId && (
                 <div className="border-2 border-amber-200 p-4 mt-6 bg-amber-50/50" data-testid="catalogue-codes-panel">
-                  <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
                     <h3 className="text-sm font-bold uppercase tracking-wider flex items-center gap-1.5 text-amber-900">
                       <CalcIcon className="w-4 h-4 text-amber-600" />
                       Catalogue Codes
                     </h3>
-                    <button
-                      onClick={() => loadCatalogueCodes(editId)}
-                      className="text-[11px] uppercase tracking-wider text-amber-700 hover:text-amber-900 font-semibold"
-                      data-testid="catalogue-codes-refresh"
-                    >
-                      Refresh
-                    </button>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {["myntra", "flipkart", "ajio"].map((plat) => (
+                        <button
+                          key={plat}
+                          onClick={() => openExportModal(plat)}
+                          disabled={
+                            !catalogueCodes ||
+                            (catalogueCodes.rows || []).length === 0 ||
+                            (catalogueCodes.unmapped_colors || []).length > 0
+                          }
+                          className="text-[11px] uppercase tracking-wider text-white bg-amber-700 hover:bg-amber-800 disabled:bg-amber-300 disabled:cursor-not-allowed font-semibold px-2 py-1 rounded inline-flex items-center gap-1"
+                          data-testid={`catalogue-export-btn-${plat}`}
+                          title={
+                            (catalogueCodes?.unmapped_colors || []).length > 0
+                              ? `Cannot export while unmapped colours exist: ${catalogueCodes.unmapped_colors.join(", ")}`
+                              : `Generate a new-listing upload file for ${plat}`
+                          }
+                        >
+                          <Download className="w-3 h-3" /> {plat} listing
+                        </button>
+                      ))}
+                      <button
+                        onClick={() => loadCatalogueCodes(editId)}
+                        className="text-[11px] uppercase tracking-wider text-amber-700 hover:text-amber-900 font-semibold ml-1"
+                        data-testid="catalogue-codes-refresh"
+                      >
+                        Refresh
+                      </button>
+                    </div>
                   </div>
                   <p className="text-[11px] text-amber-800/80 mb-3 leading-snug">
                     Generated from <span className="font-mono font-semibold">{form.code || "SSK_XXXXX"}</span> and the planned colour/size matrix.
@@ -1318,6 +1450,210 @@ export default function Styles() {
                   </BtnPrimary>
                 </div>
               </div>
+            </div>
+          </div>
+        </Drawer>
+      )}
+
+      {exportOpen && (
+        <Drawer
+          onClose={() => setExportOpen(false)}
+          title={`Generate Listing File — ${exportPlatform.toUpperCase()}`}
+          width="max-w-3xl"
+        >
+          <div className="p-4 sm:p-6 space-y-4" data-testid="catalogue-export-modal">
+            <div className="bg-amber-50 border border-amber-200 rounded p-3 text-xs text-amber-900 leading-snug">
+              This generates the exact .xlsx a merchandiser uploads to{" "}
+              <span className="font-semibold">{exportPlatform}</span>'s seller panel to catalogue{" "}
+              <span className="font-mono font-semibold">{form.code}</span>. Our SSK codes go straight
+              into the platform's SKU column, so when the platform's own export is re-imported later
+              it matches with zero manual reconciliation. Provisional SKU-map rows are inserted with
+              status <span className="font-mono">pending_platform_confirmation</span>.
+            </div>
+
+            {/* Platform selector — only platforms with an export_template configured */}
+            <div>
+              <label className="block text-[10px] uppercase tracking-wider font-bold text-slate-600 mb-1">
+                Platform
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {(exportPlatformsAvailable.length > 0
+                  ? exportPlatformsAvailable.map((c) => c.platform)
+                  : ["myntra", "flipkart", "ajio"]
+                ).map((p) => (
+                  <button
+                    key={p}
+                    onClick={() => {
+                      setExportPlatform(p);
+                      setExportPreview(null);
+                    }}
+                    className={`text-xs px-2.5 py-1 rounded border font-semibold uppercase ${
+                      exportPlatform === p
+                        ? "bg-amber-700 text-white border-amber-700"
+                        : "bg-white text-slate-700 border-slate-300 hover:border-amber-500"
+                    }`}
+                    data-testid={`export-platform-${p}`}
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Colour / size selection */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">
+                    Colours ({exportColors.length}/{(catalogueCodes?.colors || []).length})
+                  </label>
+                  <div className="flex gap-2 text-[10px]">
+                    <button
+                      className="text-slate-600 hover:text-slate-900 underline"
+                      onClick={() => setExportColors(catalogueCodes?.colors || [])}
+                    >
+                      all
+                    </button>
+                    <button
+                      className="text-slate-600 hover:text-slate-900 underline"
+                      onClick={() => setExportColors([])}
+                    >
+                      none
+                    </button>
+                  </div>
+                </div>
+                <div className="max-h-48 overflow-y-auto border border-slate-200 bg-white rounded p-2 space-y-1">
+                  {(catalogueCodes?.colors || []).map((c) => (
+                    <label
+                      key={c}
+                      className="flex items-center gap-2 text-xs cursor-pointer hover:bg-slate-50 px-1.5 py-0.5 rounded"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={exportColors.includes(c)}
+                        onChange={() => toggleColor(c)}
+                        data-testid={`export-color-${c}`}
+                      />
+                      <span>{c}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">
+                    Sizes ({exportSizes.length}/{(catalogueCodes?.sizes || []).length})
+                  </label>
+                  <div className="flex gap-2 text-[10px]">
+                    <button
+                      className="text-slate-600 hover:text-slate-900 underline"
+                      onClick={() => setExportSizes(catalogueCodes?.sizes || [])}
+                    >
+                      all
+                    </button>
+                    <button
+                      className="text-slate-600 hover:text-slate-900 underline"
+                      onClick={() => setExportSizes([])}
+                    >
+                      none
+                    </button>
+                  </div>
+                </div>
+                <div className="max-h-48 overflow-y-auto border border-slate-200 bg-white rounded p-2 grid grid-cols-3 gap-1">
+                  {(catalogueCodes?.sizes || []).map((s) => (
+                    <label
+                      key={s}
+                      className="flex items-center gap-2 text-xs cursor-pointer hover:bg-slate-50 px-1.5 py-0.5 rounded"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={exportSizes.includes(s)}
+                        onChange={() => toggleSize(s)}
+                        data-testid={`export-size-${s}`}
+                      />
+                      <span className="font-mono">{s}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="text-xs text-slate-600">
+              Will generate <span className="font-semibold">{exportColors.length * exportSizes.length}</span>{" "}
+              rows ({exportColors.length} colours × {exportSizes.length} sizes).
+            </div>
+
+            {exportError && (
+              <div
+                className={`text-xs px-3 py-2 rounded border ${
+                  exportError.startsWith("Downloaded")
+                    ? "bg-green-50 border-green-200 text-green-800"
+                    : "bg-red-50 border-red-200 text-red-800"
+                }`}
+                data-testid="export-message"
+              >
+                {exportError}
+              </div>
+            )}
+
+            {/* Preview panel */}
+            {exportPreview && (
+              <div className="border border-slate-200 rounded bg-white">
+                <div className="px-3 py-2 border-b border-slate-200 text-[10px] uppercase tracking-wider font-bold text-slate-600 bg-slate-50">
+                  Preview — sheet "{exportPreview.sheet_name}", header row index{" "}
+                  {exportPreview.header_row_index}, {exportPreview.row_count} data rows
+                </div>
+                <div className="overflow-x-auto max-h-64">
+                  <table className="text-[11px] w-full">
+                    <thead className="bg-slate-100 sticky top-0">
+                      <tr>
+                        {exportPreview.header.map((h, i) => (
+                          <th key={i} className="text-left px-2 py-1 border-b border-slate-200 font-mono whitespace-nowrap">
+                            {h}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {exportPreview.rows.slice(0, 20).map((row, ri) => (
+                        <tr key={ri} className="border-b border-slate-100">
+                          {row.map((cell, ci) => (
+                            <td key={ci} className="px-2 py-1 whitespace-nowrap">
+                              {cell === null || cell === undefined || cell === ""
+                                ? <span className="text-slate-300">—</span>
+                                : String(cell)}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {exportPreview.rows.length > 20 && (
+                  <div className="px-3 py-1.5 text-[11px] text-slate-500 italic bg-slate-50 border-t">
+                    …{exportPreview.rows.length - 20} more rows (download to see full file)
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200">
+              <BtnSecondary onClick={() => setExportOpen(false)}>Close</BtnSecondary>
+              <BtnSecondary
+                onClick={runExportPreview}
+                disabled={exportBusy || exportColors.length === 0 || exportSizes.length === 0}
+                data-testid="catalogue-export-preview-btn"
+              >
+                {exportBusy && !exportPreview ? "Previewing…" : "Preview"}
+              </BtnSecondary>
+              <BtnPrimary
+                onClick={downloadExport}
+                disabled={exportBusy || exportColors.length === 0 || exportSizes.length === 0}
+                data-testid="catalogue-export-download-btn"
+              >
+                <Download className="w-4 h-4 mr-1.5" />
+                {exportBusy ? "Working…" : "Download .xlsx"}
+              </BtnPrimary>
             </div>
           </div>
         </Drawer>
