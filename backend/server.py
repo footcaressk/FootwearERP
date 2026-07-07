@@ -4387,6 +4387,704 @@ async def catalogue_export_preview(payload: CatalogueExportRequest, request: Req
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# ══ ORDER IMPORT FORMAT REGISTRY (Phase G) ═════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Config-driven registry for ORDER / PICKLIST imports — mirrors the
+# listing_format_configs pattern but with an order-specific column-map
+# vocabulary. Adding a 4th/5th platform's order-export or picklist-export
+# format requires only a new config row, not new code.
+#
+# Canonical order fields (any platform's file must map to some subset):
+#   order_id, order_item_id, shipment_id, order_date, dispatch_by_date
+#   leaf_sku, myntra_sku_code, product_title, qty
+#   selling_price, invoice_amount, order_state, tracking_id
+#   buyer_name, city, state, pincode, bin_barcode
+#
+# is_picklist=True platforms (e.g. Myntra picklist) may lack order_id
+# entirely — the importer derives a picklist_batch_id from the filename.
+# ═══════════════════════════════════════════════════════════════════════
+
+ORDER_CANONICAL_FIELDS = [
+    "order_id", "order_item_id", "shipment_id",
+    "order_date", "dispatch_by_date",
+    "leaf_sku", "myntra_sku_code",
+    "product_title", "qty",
+    "selling_price", "invoice_amount",
+    "order_state", "tracking_id",
+    "buyer_name", "city", "state", "pincode",
+    "bin_barcode",
+]
+
+
+class OrderImportFormatConfigIn(BaseModel):
+    platform: Platform
+    sheet_locator: SheetLocator
+    header_locator: HeaderLocator
+    skip_rows_after_header: int = 0
+    # canonical field -> actual column name in this platform's file (null when absent)
+    column_map: Dict[str, Optional[str]]
+    # Non-numeric/non-code prefixes to strip from leaf_sku BEFORE
+    # split_leaf_sku()/resolve_style(). Configurable so new platform
+    # prefixes (e.g. "TH" for Flipkart, "FLL" for a Myntra doubled prefix)
+    # can be added without a code deploy.
+    known_sku_prefixes_to_strip: List[str] = Field(default_factory=list)
+    # True for pure-picklist files that have no order_id at all
+    # (e.g. Myntra OP-xxxxx.csv). The importer will derive a
+    # picklist_batch_id from the filename in that case.
+    is_picklist: bool = False
+    active: bool = True
+    notes: Optional[str] = ""
+
+    @field_validator("column_map")
+    @classmethod
+    def _order_column_map_leaf_sku(cls, v):
+        if not isinstance(v, dict):
+            raise PydanticCustomError("column_map_type", "column_map must be an object")
+        if not v.get("leaf_sku"):
+            raise PydanticCustomError(
+                "column_map_leaf_sku",
+                "column_map.leaf_sku is required — every order/picklist file must expose our internal SKU column"
+            )
+        return v
+
+
+class OrderImportFormatConfigUpdate(BaseModel):
+    sheet_locator: Optional[SheetLocator] = None
+    header_locator: Optional[HeaderLocator] = None
+    skip_rows_after_header: Optional[int] = None
+    column_map: Optional[Dict[str, Optional[str]]] = None
+    known_sku_prefixes_to_strip: Optional[List[str]] = None
+    is_picklist: Optional[bool] = None
+    active: Optional[bool] = None
+    notes: Optional[str] = None
+
+    @field_validator("column_map")
+    @classmethod
+    def _order_column_map_opt(cls, v):
+        if v is None: return v
+        if not isinstance(v, dict):
+            raise PydanticCustomError("column_map_type", "column_map must be an object")
+        if not v.get("leaf_sku"):
+            raise PydanticCustomError(
+                "column_map_leaf_sku",
+                "column_map.leaf_sku is required"
+            )
+        return v
+
+
+DEFAULT_ORDER_IMPORT_CONFIGS = [
+    # ── Flipkart Order CSV ──────────────────────────────────────────────
+    # Single-sheet CSV / xlsx. Header row 0. SKU column is our own catalogue
+    # code but appears in multiple forms in the same file — split_leaf_sku()
+    # + strip_known_prefixes() handle the variants without hardcoding.
+    # ORDER ITEM ID values can carry a leading apostrophe (Excel text-safety
+    # artefact); the importer strips that.
+    {
+        "platform": "flipkart",
+        "sheet_locator": {"type": "first_sheet"},
+        "header_locator": {"type": "fixed_row", "row": 0},
+        "skip_rows_after_header": 0,
+        "column_map": {
+            "order_id":         "Order Id",
+            "order_item_id":    "ORDER ITEM ID",
+            "shipment_id":      "Shipment ID",
+            "order_date":       "Ordered On",
+            "leaf_sku":         "SKU",
+            "product_title":    "Product",
+            "qty":              "Quantity",
+            "selling_price":    "Selling Price Per Item",
+            "invoice_amount":   "Invoice Amount",
+            "order_state":      "Order State",
+            "tracking_id":      "Tracking ID",
+            "dispatch_by_date": "Dispatch by date",
+            "buyer_name":       "Buyer name",
+            "city":             "City",
+            "state":            "State",
+            "pincode":          "PIN Code",
+        },
+        "known_sku_prefixes_to_strip": ["TH"],
+        "is_picklist": False,
+        "active": True,
+        "notes": "Flipkart order-CSV export. SKU column carries multiple naming variants — split_leaf_sku() + strip_known_prefixes() normalise them. Order Item Id may have a leading apostrophe.",
+    },
+    # ── Myntra Picklist CSV ────────────────────────────────────────────
+    # OP-xxxxx.csv style picklist — NO order id, order date, or shipment id.
+    # Filename (minus extension) is used as picklist_batch_id. qty can be
+    # >1 per row — do NOT assume 1 unit per row.
+    {
+        "platform": "myntra",
+        "sheet_locator": {"type": "first_sheet"},
+        "header_locator": {"type": "fixed_row", "row": 0},
+        "skip_rows_after_header": 0,
+        "column_map": {
+            "order_id":         None,     # picklist has no order id
+            "myntra_sku_code":  "myntraSkuCode",
+            "leaf_sku":         "sellerSkuCode",
+            "product_title":    "productDescription",
+            "qty":              "quantity",
+            "bin_barcode":      "binBarcode",
+        },
+        "known_sku_prefixes_to_strip": ["FLL"],   # doubled-FL typo variant seen in fixtures
+        "is_picklist": True,
+        "active": True,
+        "notes": "Myntra picklist (OP-xxxxx.csv). No order_id — the filename (minus extension) is stored as picklist_batch_id. sellerSkuCode carries multiple naming variants; strip 'FLL' -> 'FL' before resolving.",
+    },
+]
+
+
+async def _seed_order_import_configs() -> int:
+    """Idempotently seed order_import_format_configs (Phase G)."""
+    try:
+        await db.order_import_format_configs.create_index(
+            "platform", unique=True, name="oifc_platform_unique",
+        )
+    except Exception as e:
+        log.warning(f"Could not create order_import_format_configs index: {e}")
+    inserted = 0
+    for cfg in DEFAULT_ORDER_IMPORT_CONFIGS:
+        existing = await db.order_import_format_configs.find_one({"platform": cfg["platform"]})
+        if existing:
+            continue
+        doc = dict(cfg)
+        doc["created_at"] = now_iso()
+        doc["updated_at"] = now_iso()
+        doc["seeded"]     = True
+        await db.order_import_format_configs.insert_one(doc)
+        inserted += 1
+    return inserted
+
+
+# ── split_leaf_sku helper ────────────────────────────────────────────
+# Splits a leaf SKU like "CC-050-BE-8" or "2504-FAKC-001-GO-37" into
+# (group_id, size_token, flags). Used both by the listing-import work
+# (Phase C) and by the order-import work (this phase) — SAME logic in
+# ONE place so a bug fix here propagates to both. Tricky cases:
+#   "2504-FAKC-001-GO-37"       → ("2504-FAKC-001-GO", "37", [])
+#   "CC-045-BG-4"               → ("CC-045-BG", "4", [])
+#   "FL_DB_015_GO_38"           → ("FL_DB_015_GO", "38", [])
+#   "SH_CC-051-GO-4"            → ("SH_CC-051-GO", "4", []) — splits validly;
+#                                 downstream resolve_style() flags it as
+#                                 unresolved if the group isn't in sku_map.
+#   "SIZE-BUCKET"               → ("SIZE-BUCKET", None,
+#                                  ["group_id_derivation_failed"])
+#   ""                          → ("", None, ["empty_leaf_sku"])
+
+DEFAULT_SIZE_LABELS = ["XS", "S", "M", "L", "XL", "XXL", "Free Size", "FreeSize", "FS"]
+NUMERIC_SIZE_RE     = re.compile(r"^\d{1,2}$")
+
+
+def split_leaf_sku(
+    leaf_sku: str,
+    size_labels: Optional[List[str]] = None,
+) -> Tuple[str, Optional[str], List[str]]:
+    """Split leaf_sku into (group_id, size_token, flags).
+
+    Strategy: find the LAST "-" or "_" (whichever is closer to the end),
+    treat everything after as the candidate size token. Accept only if
+    the token matches ^\\d{1,2}$ OR appears in size_labels (case-insensitive).
+    Do NOT force a split when the trailing token doesn't look size-like —
+    the row gets flagged and routed to the exception queue instead.
+    """
+    raw = (leaf_sku or "").strip()
+    if not raw:
+        return "", None, ["empty_leaf_sku"]
+
+    labels = size_labels or DEFAULT_SIZE_LABELS
+    labels_lc = {s.lower() for s in labels}
+
+    # Find the rightmost dash/underscore
+    last_dash  = raw.rfind("-")
+    last_under = raw.rfind("_")
+    cut = max(last_dash, last_under)
+    if cut <= 0 or cut == len(raw) - 1:
+        return raw, None, ["group_id_derivation_failed"]
+
+    head = raw[:cut]
+    tail = raw[cut + 1:]
+
+    is_numeric_size = bool(NUMERIC_SIZE_RE.match(tail))
+    is_label_size   = tail.lower() in labels_lc
+
+    if is_numeric_size or is_label_size:
+        return head, tail, []
+
+    # Trailing token doesn't look size-like — flag rather than guess.
+    return raw, None, ["group_id_derivation_failed"]
+
+
+def strip_known_prefixes(sku: str, prefixes: List[str]) -> Tuple[str, Optional[str]]:
+    """Strip the FIRST matching prefix from sku. Returns (stripped, matched_prefix or None).
+
+    Prefixes are tried longest-first so "FLL" wins over "FL" when both are
+    configured. Match is case-sensitive to avoid stripping "th" from a
+    genuine SKU segment. Also strips a following delimiter ("_" or "-")
+    so "TH_FL_DB_015" → "FL_DB_015", not "_FL_DB_015".
+    """
+    s = (sku or "").strip()
+    if not s or not prefixes:
+        return s, None
+    for pfx in sorted(prefixes, key=len, reverse=True):
+        if not pfx:
+            continue
+        if s.startswith(pfx):
+            # Also eat a following underscore/dash so the remainder is a clean SKU
+            rest = s[len(pfx):]
+            if rest and rest[0] in "_-":
+                rest = rest[1:]
+            return rest, pfx
+    return s, None
+
+
+def strip_excel_apostrophe(s: str) -> str:
+    """Strip Excel's leading text-safety apostrophe (e.g. \"'4380193...\")."""
+    if not s:
+        return s
+    return s[1:] if s.startswith("'") else s
+
+
+# ── Config-driven file reader ────────────────────────────────────────
+def _resolve_data_sheet_and_header(wb, cfg: dict) -> Tuple[Any, int, List[str]]:
+    """Locate the data sheet and the header row per config. Returns
+    (sheet, header_row_1_based, header_values_list)."""
+    sheet_locator  = cfg.get("sheet_locator")  or {"type": "first_sheet"}
+    header_locator = cfg.get("header_locator") or {"type": "fixed_row", "row": 0}
+
+    # Sheet
+    if sheet_locator.get("type") == "fixed_name":
+        name = (sheet_locator.get("name") or "").strip()
+        if name not in wb.sheetnames:
+            raise HTTPException(400, f"Expected sheet '{name}' not found in workbook. Sheets: {wb.sheetnames}")
+        ws = wb[name]
+    elif sheet_locator.get("type") == "name_contains":
+        sub = (sheet_locator.get("substring") or "").strip().lower()
+        match = next((n for n in wb.sheetnames if sub in n.lower()), None)
+        if not match:
+            raise HTTPException(400, f"No sheet name contains '{sub}'. Sheets: {wb.sheetnames}")
+        ws = wb[match]
+    else:
+        ws = wb.worksheets[0]
+
+    # Header
+    if header_locator.get("type") == "fixed_row":
+        hdr_idx = int(header_locator.get("row") or 0)   # 0-based
+        header_row_1 = hdr_idx + 1
+        header = [str(c.value).strip() if c.value is not None else ""
+                  for c in ws[header_row_1]]
+    elif header_locator.get("type") == "scan_for_columns":
+        needles = [str(x).strip().lower() for x in (header_locator.get("must_contain_any") or []) if x]
+        header_row_1 = None
+        for r in range(1, min(ws.max_row, 12) + 1):
+            cells = [str(c.value).strip() if c.value is not None else "" for c in ws[r]]
+            lc = {c.lower() for c in cells}
+            if any(n in lc for n in needles):
+                header_row_1 = r
+                break
+        if header_row_1 is None:
+            raise HTTPException(
+                400,
+                f"Header row not found — no row in first 12 contains any of {header_locator.get('must_contain_any')}"
+            )
+        header = [str(c.value).strip() if c.value is not None else ""
+                  for c in ws[header_row_1]]
+    else:
+        header_row_1 = 1
+        header = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+
+    return ws, header_row_1, header
+
+
+def _read_workbook_or_csv(content: bytes, filename: str):
+    """Return an openpyxl Workbook-like object from either an .xlsx or .csv upload.
+
+    For CSV we build an in-memory single-sheet workbook so the same
+    sheet/header locator logic works uniformly. This is deliberate — the
+    config schema shouldn't care whether the physical file is xlsx or csv.
+    """
+    from openpyxl import Workbook, load_workbook
+    import io as _io
+    import csv as _csv
+
+    name_lc = (filename or "").lower()
+    if name_lc.endswith(".csv"):
+        # Decode with UTF-8 BOM tolerance, fall back to latin-1
+        try:    text = content.decode("utf-8-sig")
+        except UnicodeDecodeError: text = content.decode("latin-1")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "csv"
+        reader = _csv.reader(_io.StringIO(text))
+        for row in reader:
+            ws.append(row)
+        return wb
+    else:
+        return load_workbook(_io.BytesIO(content), data_only=True, read_only=False)
+
+
+# ── Endpoints (CRUD) ─────────────────────────────────────────────────
+@api.get("/order-import-format-configs")
+async def list_order_import_configs(request: Request, active: Optional[bool] = None):
+    await get_current_user(request)
+    q: Dict[str, Any] = {}
+    if active is not None: q["active"] = active
+    docs = await db.order_import_format_configs.find(q).sort("platform", 1).to_list(1000)
+    return [stringify(d) for d in docs]
+
+
+@api.get("/order-import-format-configs/_meta/canonical-fields")
+async def get_order_canonical_fields(request: Request):
+    await get_current_user(request)
+    return {"canonical_fields": ORDER_CANONICAL_FIELDS}
+
+
+@api.get("/order-import-format-configs/{platform}")
+async def get_order_import_config(platform: str, request: Request):
+    await get_current_user(request)
+    doc = await db.order_import_format_configs.find_one({"platform": platform.lower()})
+    if not doc:
+        raise HTTPException(404, f"No order-import config for platform '{platform}'")
+    return stringify(doc)
+
+
+@api.post("/order-import-format-configs")
+async def create_order_import_config(payload: OrderImportFormatConfigIn, request: Request):
+    u = await get_current_user(request); require_roles("admin")(u)
+    if await db.order_import_format_configs.find_one({"platform": payload.platform}):
+        raise HTTPException(409, f"Config for platform '{payload.platform}' already exists — use PUT to update")
+    doc = payload.model_dump()
+    doc["created_at"] = now_iso(); doc["updated_at"] = now_iso(); doc["seeded"] = False
+    try:
+        res = await db.order_import_format_configs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, f"Config for platform '{payload.platform}' already exists")
+    doc.pop("_id", None); doc["id"] = str(res.inserted_id)
+    await log_activity("order_import_format.create", "order_import_format_configs",
+                       f"Added order-import config for {payload.platform}", u["email"])
+    return doc
+
+
+@api.put("/order-import-format-configs/{platform}")
+async def update_order_import_config(platform: str, payload: OrderImportFormatConfigUpdate, request: Request):
+    u = await get_current_user(request); require_roles("admin")(u)
+    platform_lc = platform.lower()
+    existing = await db.order_import_format_configs.find_one({"platform": platform_lc})
+    if not existing:
+        raise HTTPException(404, f"No order-import config for platform '{platform_lc}'")
+    update: Dict[str, Any] = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
+    if not update:
+        return stringify(existing)
+    update["updated_at"] = now_iso()
+    await db.order_import_format_configs.update_one({"platform": platform_lc}, {"$set": update})
+    fresh = await db.order_import_format_configs.find_one({"platform": platform_lc})
+    await log_activity("order_import_format.update", "order_import_format_configs",
+                       f"Updated order-import config for {platform_lc}: {', '.join(update.keys())}", u["email"])
+    return stringify(fresh)
+
+
+# ── Canonical row parser + full config-driven order import ───────────
+async def _parse_and_resolve_order_row(
+    raw_row: dict,
+    cfg: dict,
+    platform: str,
+    picklist_batch_id: Optional[str],
+) -> dict:
+    """Turn one raw row into a canonical order_import record and try to
+    resolve the leaf_sku through sku_map / styles.code."""
+    column_map: Dict[str, Optional[str]] = cfg.get("column_map") or {}
+    prefixes  = cfg.get("known_sku_prefixes_to_strip") or []
+
+    def _pick(canonical: str) -> str:
+        col = column_map.get(canonical)
+        if not col:
+            return ""
+        v = raw_row.get(col)
+        if v is None:
+            # Try case-insensitive lookup as a fallback
+            col_lc = col.lower()
+            for k, val in raw_row.items():
+                if str(k).strip().lower() == col_lc:
+                    v = val
+                    break
+        return "" if v is None else str(v).strip()
+
+    canon = {
+        "platform":          platform,
+        "picklist_batch_id": picklist_batch_id,
+    }
+    for f in ORDER_CANONICAL_FIELDS:
+        canon[f] = _pick(f)
+
+    # Strip Excel apostrophe from id-ish fields
+    for key in ("order_id", "order_item_id", "shipment_id", "tracking_id"):
+        canon[key] = strip_excel_apostrophe(canon.get(key) or "")
+
+    # Qty
+    try:    canon["qty"] = int(float(canon.get("qty") or 0))
+    except: canon["qty"] = 0
+
+    leaf_raw = canon.get("leaf_sku") or ""
+    canon["leaf_sku_raw"] = leaf_raw
+
+    # Normalise sku: strip apostrophe + known prefixes
+    leaf = strip_excel_apostrophe(leaf_raw)
+    leaf_stripped, matched_prefix = strip_known_prefixes(leaf, prefixes)
+    canon["leaf_sku_stripped_prefix"] = matched_prefix
+    canon["leaf_sku"] = leaf_stripped
+
+    # split into group + size
+    group_id, size_token, flags = split_leaf_sku(leaf_stripped)
+    canon["group_id"]     = group_id
+    canon["derived_size"] = size_token
+    canon["flags"]        = list(flags)   # may contain "group_id_derivation_failed" / "empty_leaf_sku"
+
+    # Resolve via existing pipeline: try full leaf_sku first, then group_id,
+    # so we hit both sku_map's group-level rows (created by Phase F catalogue
+    # export) and any leaf-level manual mappings.
+    resolved = {"matched": False, "match_via": None}
+    for candidate in (leaf_stripped, group_id):
+        if not candidate:
+            continue
+        r = await resolve_style(
+            source_type="online_channel",
+            source_name=platform,
+            external_sku=candidate,
+        )
+        if r.get("matched"):
+            resolved = r
+            resolved["resolved_from"] = candidate
+            break
+
+    canon["style_id"]   = resolved.get("style_id")
+    canon["style_code"] = resolved.get("style_code")
+    canon["match_via"]  = resolved.get("match_via")
+    canon["matched"]    = bool(resolved.get("matched"))
+    canon["resolved_from"] = resolved.get("resolved_from")
+
+    # Prefer resolved size from sku_map, else the derived size, else the size
+    # column from the file (some platforms have a *Size column even when the
+    # SKU also embeds it — order-import configs currently don't map size, so
+    # this branch mostly defers to derived_size).
+    canon["size"] = resolved.get("size") or size_token or canon.get("size", "") or ""
+    canon["color"] = resolved.get("color") or ""
+
+    # Reason for exception queue when not matched
+    if not canon["matched"]:
+        if canon["flags"]:
+            canon["exception_reason"] = "; ".join(canon["flags"])
+        else:
+            canon["exception_reason"] = f"leaf_sku '{leaf_stripped}' (and derived group '{group_id}') not in sku_map / styles"
+
+    # Preserve original row for audit — cast keys to strings and drop None values
+    canon["raw_row"] = {str(k): ("" if v is None else str(v)) for k, v in raw_row.items()}
+    return canon
+
+
+class OrderImportConfiguredRequest(BaseModel):
+    # Not used — endpoint takes multipart. Kept for OpenAPI clarity.
+    pass
+
+
+@api.post("/online-orders/import-configured")
+async def import_online_orders_configured(
+    file: UploadFile = File(...),
+    platform: str = "flipkart",
+    dry_run: bool = True,
+    request: Request = None,
+):
+    """Config-driven order/picklist import. Uses order_import_format_configs
+    to locate the sheet + header + map columns → canonical order_import
+    schema. Resolves each row's leaf_sku via sku_map/styles.code (with
+    prefix stripping + size-token derivation).
+
+    Query params:
+      - platform  : which config to use (e.g. 'flipkart', 'myntra')
+      - dry_run   : if true (default), returns the parsed preview WITHOUT
+                    persisting to online_orders / online_order_items.
+                    Set to false to commit.
+
+    Returns a summary + list of canonical rows.
+    """
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+
+    platform_lc = (platform or "").strip().lower()
+    cfg_doc = await db.order_import_format_configs.find_one({"platform": platform_lc})
+    if not cfg_doc:
+        raise HTTPException(
+            400,
+            f"No order-import config for platform '{platform_lc}'. "
+            "Create one via POST /api/order-import-format-configs first."
+        )
+    if not cfg_doc.get("active", True):
+        raise HTTPException(400, f"Order-import config for '{platform_lc}' is inactive.")
+
+    cfg = stringify(cfg_doc)
+
+    # Read file
+    content = await file.read()
+    filename = file.filename or "upload"
+    picklist_batch_id: Optional[str] = None
+    if cfg.get("is_picklist"):
+        # Derive from filename stem (spec: "OP20625445.csv" → "OP20625445")
+        stem = filename.rsplit(".", 1)[0].strip()
+        picklist_batch_id = stem or "unnamed_picklist"
+
+    wb = _read_workbook_or_csv(content, filename)
+    ws, header_row_1, header = _resolve_data_sheet_and_header(wb, cfg)
+    skip = int(cfg.get("skip_rows_after_header") or 0)
+
+    first_data_row_1 = header_row_1 + 1 + skip
+
+    canonical_rows: List[dict] = []
+    stats = {
+        "total_rows_read":            0,
+        "matched":                    0,
+        "unmatched":                  0,
+        "derivation_failed":          0,
+        "empty_leaf_sku":             0,
+        "order_style_rows":           0,   # rows with an order_id
+        "picklist_rows":              0,   # rows with no order_id (or is_picklist config)
+        "distinct_orders":            0,
+    }
+    order_ids_seen: set = set()
+
+    for r_idx in range(first_data_row_1, ws.max_row + 1):
+        row_cells = [ws.cell(row=r_idx, column=c).value for c in range(1, len(header) + 1)]
+        # skip totally blank rows
+        if all((v is None or (isinstance(v, str) and not v.strip())) for v in row_cells):
+            continue
+        raw_row = {header[i]: row_cells[i] for i in range(len(header)) if header[i]}
+        canon = await _parse_and_resolve_order_row(raw_row, cfg, platform_lc, picklist_batch_id)
+        canon["source_row_index"] = r_idx    # 1-based row in the actual sheet
+        canonical_rows.append(canon)
+
+        stats["total_rows_read"] += 1
+        if canon["matched"]:            stats["matched"]           += 1
+        else:                           stats["unmatched"]         += 1
+        if "group_id_derivation_failed" in canon["flags"]:
+            stats["derivation_failed"] += 1
+        if "empty_leaf_sku" in canon["flags"]:
+            stats["empty_leaf_sku"]    += 1
+        if canon.get("order_id"):
+            stats["order_style_rows"] += 1
+            order_ids_seen.add(canon["order_id"])
+        else:
+            stats["picklist_rows"]    += 1
+
+    stats["distinct_orders"] = len(order_ids_seen)
+
+    # ── Commit path ─────────────────────────────────────────────────
+    committed = {"orders_created": 0, "items_created": 0, "exceptions_queued": 0}
+    import_batch_id = None
+    if not dry_run:
+        import_batch_id = f"IMP_{platform_lc}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        # Group rows by order_id (or by picklist_batch_id for picklist-mode)
+        orders_by_key: Dict[str, dict] = {}
+        exceptions: List[dict] = []
+        for canon in canonical_rows:
+            group_key = canon.get("order_id") or picklist_batch_id or f"orphan_{canon['source_row_index']}"
+            if group_key not in orders_by_key:
+                orders_by_key[group_key] = {
+                    "platform":          platform_lc,
+                    "order_id":          canon.get("order_id"),
+                    "picklist_batch_id": canon.get("picklist_batch_id"),
+                    "order_date":        canon.get("order_date"),
+                    "dispatch_by_date":  canon.get("dispatch_by_date"),
+                    "buyer_name":        canon.get("buyer_name"),
+                    "city":              canon.get("city"),
+                    "state":             canon.get("state"),
+                    "pincode":           canon.get("pincode"),
+                    "items":             [],
+                    "import_batch_id":   import_batch_id,
+                    "created_at":        now_iso(),
+                    "updated_at":        now_iso(),
+                    "created_by":        u["email"],
+                }
+            item_doc = {
+                "order_item_id":     canon.get("order_item_id"),
+                "shipment_id":       canon.get("shipment_id"),
+                "leaf_sku_raw":      canon.get("leaf_sku_raw"),
+                "leaf_sku":          canon.get("leaf_sku"),
+                "leaf_sku_stripped_prefix": canon.get("leaf_sku_stripped_prefix"),
+                "group_id":          canon.get("group_id"),
+                "myntra_sku_code":   canon.get("myntra_sku_code"),
+                "product_title":     canon.get("product_title"),
+                "qty":               canon.get("qty"),
+                "selling_price":     canon.get("selling_price"),
+                "invoice_amount":    canon.get("invoice_amount"),
+                "order_state":       canon.get("order_state"),
+                "tracking_id":       canon.get("tracking_id"),
+                "bin_barcode":       canon.get("bin_barcode"),
+                "style_id":          canon.get("style_id"),
+                "style_code":        canon.get("style_code"),
+                "size":              canon.get("size"),
+                "color":             canon.get("color"),
+                "match_via":         canon.get("match_via"),
+                "matched":           canon.get("matched"),
+                "resolved_from":     canon.get("resolved_from"),
+                "flags":             canon.get("flags"),
+                "exception_reason":  canon.get("exception_reason"),
+                "source_row_index":  canon.get("source_row_index"),
+                "raw_row":           canon.get("raw_row"),
+            }
+            orders_by_key[group_key]["items"].append(item_doc)
+            if not canon.get("matched"):
+                exceptions.append({
+                    "import_batch_id": import_batch_id,
+                    "platform":         platform_lc,
+                    "order_id":         canon.get("order_id"),
+                    "picklist_batch_id":canon.get("picklist_batch_id"),
+                    "leaf_sku_raw":     canon.get("leaf_sku_raw"),
+                    "leaf_sku":         canon.get("leaf_sku"),
+                    "group_id":         canon.get("group_id"),
+                    "qty":              canon.get("qty"),
+                    "reason":           canon.get("exception_reason"),
+                    "flags":            canon.get("flags"),
+                    "raw_row":          canon.get("raw_row"),
+                    "created_at":       now_iso(),
+                    "resolved":         False,
+                })
+
+        for group_key, order_doc in orders_by_key.items():
+            # Denormalise items into embedded array — small enough per order.
+            res = await db.online_orders.insert_one(order_doc)
+            committed["orders_created"] += 1
+            committed["items_created"]  += len(order_doc["items"])
+            # Also insert each item as a top-level row for easy filtering later
+            for it in order_doc["items"]:
+                it["online_order_id"] = res.inserted_id
+                it["platform"]        = platform_lc
+                it["import_batch_id"] = import_batch_id
+                it["created_at"]      = now_iso()
+                await db.online_order_items.insert_one(it)
+
+        if exceptions:
+            await db.online_order_exceptions.insert_many(exceptions)
+            committed["exceptions_queued"] = len(exceptions)
+
+        await log_activity(
+            "IMPORT_CONFIGURED", "online_orders",
+            f"{platform_lc}: {committed['orders_created']} orders, "
+            f"{committed['items_created']} items, "
+            f"{committed['exceptions_queued']} exceptions "
+            f"(batch {import_batch_id})",
+            u["email"],
+        )
+
+    return {
+        "platform":          platform_lc,
+        "is_picklist":       bool(cfg.get("is_picklist")),
+        "picklist_batch_id": picklist_batch_id,
+        "filename":          filename,
+        "header_row_1_based":header_row_1,
+        "header":            header,
+        "dry_run":           dry_run,
+        "stats":             stats,
+        "committed":         committed if not dry_run else None,
+        "import_batch_id":   import_batch_id,
+        "rows":              canonical_rows,
+    }
+
+
 # ---------- COSTING (live preview) ----------
 @api.post("/costing/preview")
 async def costing_preview(payload: StyleIn, request: Request):
@@ -9490,6 +10188,13 @@ async def on_startup():
             log.info(f"Listing format registry: seeded {seeded_lfc} platform configs (myntra/ajio/flipkart)")
     except Exception as e:
         log.warning(f"Listing format registry seed failed: {e}")
+
+    try:
+        seeded_oifc = await _seed_order_import_configs()
+        if seeded_oifc:
+            log.info(f"Order import registry: seeded {seeded_oifc} platform configs (flipkart/myntra)")
+    except Exception as e:
+        log.warning(f"Order import registry seed failed: {e}")
     try:
         profile = await db.settings.find_one({"_id": "company_profile"})
         if profile:
