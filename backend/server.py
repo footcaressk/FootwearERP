@@ -2091,11 +2091,23 @@ async def deactivate_component(cid: str, request: Request):
 
 @api.post("/components/bulk-matrix")
 async def create_component_bulk_matrix(payload: ComponentBulkMatrix, request: Request):
-    """Create multiple (color, size) rows for one component in one shot.
-    Skips (color, size) pairs that already exist. Returns per-row status."""
+    """Create or extend multiple (color, size) rows for one component in one shot.
+
+    Two-mode behaviour so the "Add Stock in Bulk" drawer works whether the
+    user is seeding a brand-new component or topping up existing rows:
+
+      • BRAND-NEW (color, size) row → insert the master row and record an
+        opening-balance movement for `opening_qty` (if > 0).
+      • EXISTING (color, size) row  → the master row is already there, so
+        we skip the master insert (correctly) BUT we still record a
+        purchase_in movement for the entered quantity when > 0. Silently
+        dropping the entered qty was the "size matrix not populating"
+        bug — the user's typed values would vanish because the endpoint
+        treated every duplicate as a full no-op.
+    """
     u = await get_current_user(request); require_roles("admin", "manager")(u)
     now = now_iso()
-    created, skipped = 0, 0
+    created, updated, skipped = 0, 0, 0
     results = []
     for row in payload.rows:
         color = str(row.get("color", "") or "").strip()
@@ -2104,6 +2116,7 @@ async def create_component_bulk_matrix(payload: ComponentBulkMatrix, request: Re
         if opening < 0:
             results.append({"color": color, "size": size, "status": "invalid_qty"})
             continue
+        # 1. Try to insert the master row (idempotent by (code, color, size))
         try:
             doc = {
                 "component_code":     payload.component_code,
@@ -2138,13 +2151,62 @@ async def create_component_bulk_matrix(payload: ComponentBulkMatrix, request: Re
                     u["email"],
                 )
             created += 1
-            results.append({"color": color, "size": size, "status": "created"})
+            results.append({"color": color, "size": size, "status": "created", "qty": opening})
         except DuplicateKeyError:
-            skipped += 1
-            results.append({"color": color, "size": size, "status": "exists"})
-    await log_activity("BULK", "component",
-        f"{payload.component_code}: {created} rows created, {skipped} skipped", u["email"])
-    return {"created": created, "skipped": skipped, "results": results}
+            # 2. Row already exists — that's expected in "extend" mode.
+            # If the user entered a qty, apply it as a purchase_in movement
+            # so their input isn't silently dropped.
+            if opening > 0:
+                existing = await db.component_master.find_one({
+                    "component_code": payload.component_code,
+                    "color":          color,
+                    "size":           size,
+                })
+                if existing:
+                    try:
+                        await _record_component_movement(
+                            existing,
+                            ComponentMovementIn(
+                                component_id=str(existing["_id"]),
+                                movement_type="purchase_in",
+                                quantity=opening,
+                                reference_type="bulk_matrix_topup",
+                                notes="Stock added via bulk matrix (extend mode)",
+                            ),
+                            u["email"],
+                        )
+                        updated += 1
+                        results.append({
+                            "color": color, "size": size,
+                            "status": "stock_added", "qty": opening,
+                        })
+                    except HTTPException as he:
+                        results.append({
+                            "color": color, "size": size,
+                            "status": "movement_failed",
+                            "error":  str(he.detail),
+                        })
+                else:
+                    # Race: DuplicateKeyError from a UNIQUE index that
+                    # doesn't correspond to (code,color,size). Unlikely
+                    # given the index definition, but keep a safe branch.
+                    skipped += 1
+                    results.append({"color": color, "size": size, "status": "exists"})
+            else:
+                # Existing row, no qty entered → truly a no-op.
+                skipped += 1
+                results.append({"color": color, "size": size, "status": "exists"})
+    await log_activity(
+        "BULK", "component",
+        f"{payload.component_code}: {created} rows created, {updated} rows topped-up, {skipped} skipped",
+        u["email"],
+    )
+    return {
+        "created":  created,
+        "updated":  updated,   # rows already existed and got a stock top-up movement
+        "skipped":  skipped,
+        "results":  results,
+    }
 
 
 @api.post("/components/movements")
