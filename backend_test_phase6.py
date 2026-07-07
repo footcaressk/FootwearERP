@@ -11,7 +11,7 @@ import sys
 import time
 
 # Backend URL from frontend/.env
-BASE_URL = "https://wms-finished-goods.preview.emergentagent.com/api"
+BASE_URL = "https://run-here.preview.emergentagent.com/api"
 
 # Test credentials from /app/memory/test_credentials.md
 ADMIN_EMAIL = "admin@example.com"

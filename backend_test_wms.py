@@ -11,7 +11,7 @@ import io
 from typing import Dict, Any, Optional
 
 # Backend URL from frontend/.env
-BASE_URL = "https://002c829e-5fd9-46a5-a334-de9ebc760335.preview.emergentagent.com/api"
+BASE_URL = "https://run-here.preview.emergentagent.com/api"
 
 # Test credentials
 ADMIN_EMAIL = "admin@example.com"
