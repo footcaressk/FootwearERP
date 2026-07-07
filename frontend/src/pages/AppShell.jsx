@@ -17,6 +17,7 @@ const navGroups = [
       { to: "/workers", label: "Workers", icon: HardHat, roles: ["admin", "manager", "production"] },
       { to: "/payroll", label: "Payroll", icon: IndianRupee, roles: ["admin", "manager"] },
       { to: "/listing-formats", label: "Listing Formats", icon: FileText, roles: ["admin"] },
+      { to: "/order-import-formats", label: "Order Import Formats", icon: FileText, roles: ["admin"] },
       { to: "/settings", label: "Settings", icon: SettingsIcon, roles: ["admin", "manager"] },
       { to: "/users", label: "Users", icon: Users, roles: ["admin"] },
     ]

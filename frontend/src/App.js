@@ -31,6 +31,7 @@ import WarehouseReports from "@/pages/WarehouseReports";
 import WarehouseQRSheet from "@/pages/WarehouseQRSheet";
 import PendingProductList from "@/pages/PendingProductList";
 import ListingFormats from "@/pages/ListingFormats";
+import OrderImportFormats from "@/pages/OrderImportFormats";
 import SelectWorkspace from "@/pages/SelectWorkspace";
 import { Loader2 } from "lucide-react";
 
@@ -89,6 +90,7 @@ function App() {
             <Route path="warehouse/qr" element={<WarehouseQRSheet />} />
             <Route path="pending-list" element={<PendingProductList />} />
             <Route path="listing-formats" element={<ListingFormats />} />
+            <Route path="order-import-formats" element={<OrderImportFormats />} />
             <Route path="settings" element={<Settings />} />
             <Route path="users" element={<Users />} />
           </Route>

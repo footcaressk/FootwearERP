@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { http } from "../lib/api";
 import {
   PageHeader, Card, BtnPrimary, BtnSecondary,
@@ -6,17 +6,17 @@ import {
 } from "../components/ui-kit";
 import { Drawer } from "./Materials";
 import {
-  Upload, Download, ShoppingBag, CheckCircle2,
-  AlertTriangle, X, RefreshCw,
+  Upload, ShoppingBag, RefreshCw, FileWarning, Settings2,
+  ChevronLeft, PlayCircle, CheckCircle2, AlertTriangle,
 } from "lucide-react";
 import { Link } from "react-router-dom";
-
-const CHANNELS = ["myntra", "flipkart", "nykaa", "website"];
 
 const CHANNEL_COLORS = {
   myntra:   "pink",
   flipkart: "blue",
   nykaa:    "orange",
+  ajio:     "purple",
+  amazon:   "yellow",
   website:  "slate",
 };
 
@@ -26,140 +26,417 @@ const STATUS_COLORS = {
   unmatched: "red",
 };
 
-const CSV_TEMPLATE = `order_id,style_sku,quantity,color,size,unit_price,delivery_date,description
-MYN-ORD-001,MYN-SKU-101,2,Black,8,899.00,2026-07-20,Casual loafer black
-MYN-ORD-002,MYN-SKU-102,1,Brown,9,1299.00,2026-07-22,Oxford brown`;
-
-function downloadTemplate() {
-  const blob = new Blob([CSV_TEMPLATE], { type: "text/csv" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "online_orders_template.csv";
-  a.click();
-}
-
-// ── Import Drawer ────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+// Import Drawer — config-driven (Phase G)
+//
+// Flow:
+//   1. Choose platform (dropdown driven by /order-import-format-configs)
+//   2. Pick file → PREVIEW (dry_run=true) shows canonical rows, distinguishing
+//      "order rows" (have order_id) from "picklist rows" (Myntra-style, no
+//      order_id) and highlighting unmatched rows that will go to the
+//      exception queue.
+//   3. Confirm → COMMIT (dry_run=false) writes online_orders /
+//      online_order_items / online_order_exceptions.
+//
+// If the platform has no config yet, the drawer surfaces a CTA linking to
+// /order-import-formats so the admin can onboard it without a code change.
+// ═══════════════════════════════════════════════════════════════════════
 function ImportDrawer({ onClose, onDone }) {
-  const [channel, setChannel]     = useState("myntra");
-  const [orderDate, setOrderDate] = useState(new Date().toISOString().slice(0, 10));
+  const [configs, setConfigs]     = useState(null); // null = still loading
+  const [platform, setPlatform]   = useState("");
   const [file, setFile]           = useState(null);
-  const [loading, setLoading]     = useState(false);
-  const [result, setResult]       = useState(null);
+  const [step, setStep]           = useState("choose"); // choose | preview | done
+  const [preview, setPreview]     = useState(null);
+  const [committing, setCommitting] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+  const [committed, setCommitted] = useState(null);
   const [error, setError]         = useState("");
   const fileRef = useRef();
 
-  async function submit() {
-    setError(""); setResult(null);
-    if (!file) return setError("Please select a CSV file.");
-    setLoading(true);
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await http.get("/order-import-format-configs?active=true");
+        setConfigs(r.data || []);
+        if (r.data?.length) setPlatform(r.data[0].platform);
+      } catch (e) {
+        setConfigs([]);
+      }
+    })();
+  }, []);
+
+  const selectedCfg = useMemo(
+    () => (configs || []).find((c) => c.platform === platform) || null,
+    [configs, platform]
+  );
+
+  async function runPreview() {
+    setError("");
+    if (!file) return setError("Please select a file.");
+    if (!platform) return setError("Please choose a platform.");
+    setPreviewing(true);
     try {
       const fd = new FormData();
       fd.append("file", file);
-      fd.append("channel", channel);
-      fd.append("order_date", orderDate);
-      const r = await http.post("/online-orders/import", fd, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-      setResult(r.data);
-      onDone();
+      const r = await http.post(
+        `/online-orders/import-configured?platform=${encodeURIComponent(platform)}&dry_run=true`,
+        fd,
+        { headers: { "Content-Type": "multipart/form-data" } }
+      );
+      setPreview(r.data);
+      setStep("preview");
     } catch (e) {
-      setError(e.response?.data?.detail || "Import failed.");
-    } finally { setLoading(false); }
+      const raw = e.response?.data?.detail;
+      setError(typeof raw === "string" ? raw : (raw?.[0]?.msg || e.message || "Preview failed."));
+    } finally {
+      setPreviewing(false);
+    }
   }
 
+  async function runCommit() {
+    setError("");
+    setCommitting(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const r = await http.post(
+        `/online-orders/import-configured?platform=${encodeURIComponent(platform)}&dry_run=false`,
+        fd,
+        { headers: { "Content-Type": "multipart/form-data" } }
+      );
+      setCommitted(r.data);
+      setStep("done");
+      onDone();
+    } catch (e) {
+      const raw = e.response?.data?.detail;
+      setError(typeof raw === "string" ? raw : (raw?.[0]?.msg || e.message || "Import failed."));
+    } finally {
+      setCommitting(false);
+    }
+  }
+
+  function reset() {
+    setPreview(null);
+    setCommitted(null);
+    setStep("choose");
+    setError("");
+  }
+
+  const noConfigs = configs !== null && configs.length === 0;
+
   return (
-    <Drawer onClose={onClose} title="Import Online Orders (CSV)">
+    <Drawer
+      onClose={onClose}
+      title={
+        step === "choose"  ? "Import orders — step 1: choose file" :
+        step === "preview" ? "Import orders — step 2: review & commit" :
+                             "Import orders — done"
+      }
+      width="max-w-4xl"
+    >
       <div className="space-y-5">
 
-        {/* Info banner */}
-        <div className="bg-blue-50 border-2 border-blue-200 px-4 py-3 text-sm text-blue-800">
-          <div className="font-bold mb-1">Required CSV columns:</div>
-          <div className="font-mono text-xs">order_id, style_sku, quantity</div>
-          <div className="font-bold mt-2 mb-1">Optional:</div>
-          <div className="font-mono text-xs">color, size, unit_price, delivery_date, description</div>
-          <div className="mt-2 text-xs text-blue-700">
-            Unresolved SKUs are <span className="font-bold">not auto-created</span> — they appear
-            in the error list. Add their mappings at{" "}
-            <Link to="/sku-map" className="underline font-bold">SKU Mapping</Link> then re-import.
+        {/* ── No configs yet ─────────────────────────────────────── */}
+        {noConfigs && step === "choose" && (
+          <div className="bg-amber-50 border-2 border-amber-300 px-4 py-4 text-sm text-amber-900">
+            <div className="font-bold mb-1 flex items-center gap-2">
+              <FileWarning className="w-4 h-4" /> No order-import formats configured yet.
+            </div>
+            <div className="text-xs mb-3">
+              Every platform's order or picklist file format is stored as one config row —
+              adding a new marketplace does NOT require a code change.
+            </div>
+            <Link to="/order-import-formats" onClick={onClose}>
+              <BtnPrimary>
+                <span className="flex items-center gap-2">
+                  <Settings2 className="w-4 h-4" /> Configure a platform
+                </span>
+              </BtnPrimary>
+            </Link>
           </div>
-          <button onClick={downloadTemplate}
-            className="mt-2 flex items-center gap-1 text-xs font-bold underline hover:text-blue-900">
-            <Download className="w-3 h-3" /> Download template
-          </button>
-        </div>
-
-        {/* Channel */}
-        <Select label="Channel *" id="import-channel" value={channel}
-          onChange={(e) => setChannel(e.target.value)}>
-          {CHANNELS.map((c) => (
-            <option key={c} value={c}>{c.charAt(0).toUpperCase() + c.slice(1)}</option>
-          ))}
-        </Select>
-
-        {/* Order date */}
-        <Input label="Order / Import Date" id="import-date" type="date"
-          value={orderDate} onChange={(e) => setOrderDate(e.target.value)} />
-
-        {/* File picker */}
-        <div className="space-y-1">
-          <div className="text-[10px] uppercase tracking-wider font-bold text-slate-600">CSV File *</div>
-          <div
-            className="border-2 border-dashed border-slate-300 hover:border-slate-500 px-4 py-6 text-center cursor-pointer transition-colors"
-            onClick={() => fileRef.current?.click()}
-          >
-            <Upload className="w-6 h-6 text-slate-400 mx-auto mb-2" />
-            {file
-              ? <div className="text-sm font-mono font-bold text-slate-700">{file.name}</div>
-              : <div className="text-sm text-slate-500">Click to choose a .csv file</div>}
-          </div>
-          <input ref={fileRef} type="file" accept=".csv,text/csv" className="hidden"
-            onChange={(e) => setFile(e.target.files[0] || null)} />
-        </div>
-
-        {error && (
-          <div className="bg-red-50 border-2 border-red-300 px-4 py-3 text-sm text-red-700 font-semibold">{error}</div>
         )}
 
-        {/* Result summary */}
-        {result && (
-          <div className="space-y-2">
-            <div className="bg-green-50 border-2 border-green-300 px-4 py-3">
-              <div className="font-bold text-green-800 text-sm">
-                ✓ {result.imported} job{result.imported !== 1 ? "s" : ""} created
+        {/* ── STEP 1: choose ─────────────────────────────────────── */}
+        {step === "choose" && configs && configs.length > 0 && (
+          <>
+            <div className="bg-blue-50 border-2 border-blue-200 px-4 py-3 text-sm text-blue-900">
+              <div className="font-bold mb-1">Config-driven order/picklist import</div>
+              <div className="text-xs">
+                The platform dropdown drives which config row is used. Adding a 4th/5th
+                platform's format is a{" "}
+                <Link to="/order-import-formats" className="underline font-bold">
+                  new config row
+                </Link>
+                , not new code. Files that resolve cleanly become <span className="font-semibold">online_orders</span>{" "}
+                / <span className="font-semibold">online_order_items</span>; rows that don't resolve go to
+                the same exception queue used everywhere else.
               </div>
-              {result.unresolved > 0 && (
-                <div className="text-amber-700 text-xs mt-1 font-semibold">
-                  ⚠ {result.unresolved} row{result.unresolved !== 1 ? "s" : ""} unresolved — add SKU mappings and re-import
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <Select label="Platform *" id="import-platform" value={platform}
+                onChange={(e) => setPlatform(e.target.value)}>
+                {configs.map((c) => (
+                  <option key={c.platform} value={c.platform}>
+                    {c.platform.charAt(0).toUpperCase() + c.platform.slice(1)}
+                    {c.is_picklist ? "  (picklist)" : "  (order)"}
+                  </option>
+                ))}
+              </Select>
+
+              {selectedCfg && (
+                <div className="pt-6 text-xs space-y-1">
+                  <div>
+                    <span className="text-neutral-500">Type:</span>{" "}
+                    {selectedCfg.is_picklist ? (
+                      <Badge color="purple">picklist (batch, no order_id)</Badge>
+                    ) : (
+                      <Badge color="blue">order</Badge>
+                    )}
+                  </div>
+                  <div className="font-mono text-[11px] text-neutral-600">
+                    leaf_sku column: {selectedCfg.column_map?.leaf_sku || "—"}
+                  </div>
+                  {(selectedCfg.known_sku_prefixes_to_strip || []).length > 0 && (
+                    <div className="font-mono text-[11px] text-amber-700">
+                      strips prefixes: {(selectedCfg.known_sku_prefixes_to_strip || []).join(", ")}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
-            {result.errors.length > 0 && (
-              <div className="bg-amber-50 border-2 border-amber-300 px-4 py-3 max-h-52 overflow-y-auto space-y-1.5">
-                <div className="font-bold text-amber-800 text-sm">{result.errors.length} row issue{result.errors.length !== 1 ? "s" : ""}:</div>
-                {result.errors.map((e, i) => (
-                  <div key={i} className="text-xs">
-                    <span className="font-mono text-slate-500">Row {e.row}</span>
-                    {e.order_id && <span className="font-mono font-bold text-slate-700 ml-2">{e.order_id}</span>}
-                    {e.style_sku && <span className="font-mono text-red-600 ml-2">SKU: {e.style_sku}</span>}
-                    <div className="text-slate-600 ml-2 mt-0.5">{e.reason}</div>
-                  </div>
-                ))}
+
+            {/* File picker */}
+            <div className="space-y-1">
+              <div className="text-[10px] uppercase tracking-wider font-bold text-slate-600">File *</div>
+              <div
+                className="border-2 border-dashed border-slate-300 hover:border-slate-500 px-4 py-6 text-center cursor-pointer transition-colors"
+                onClick={() => fileRef.current?.click()}
+                data-testid="oo-import-file-drop"
+              >
+                <Upload className="w-6 h-6 text-slate-400 mx-auto mb-2" />
+                {file
+                  ? <div className="text-sm font-mono font-bold text-slate-700">{file.name}</div>
+                  : <div className="text-sm text-slate-500">Click to choose .csv / .xlsx</div>}
+              </div>
+              <input ref={fileRef} type="file"
+                accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                className="hidden"
+                onChange={(e) => setFile(e.target.files[0] || null)} />
+              {selectedCfg?.is_picklist && file && (
+                <div className="text-[11px] text-purple-700 mt-1">
+                  Picklist mode: filename stem <span className="font-mono font-bold">{file.name.replace(/\.[^.]+$/, "")}</span> will be stored as <span className="font-mono">picklist_batch_id</span>.
+                </div>
+              )}
+            </div>
+
+            {error && (
+              <div className="bg-red-50 border-2 border-red-300 px-4 py-3 text-sm text-red-700 font-semibold whitespace-pre-line">
+                {error}
               </div>
             )}
-          </div>
+
+            <div className="flex gap-3 pt-2">
+              <BtnPrimary id="btn-preview-import" onClick={runPreview}
+                disabled={previewing || !file} className="flex-1">
+                <span className="flex items-center justify-center gap-2">
+                  <PlayCircle className="w-4 h-4" />
+                  {previewing ? "Parsing preview…" : "Preview import"}
+                </span>
+              </BtnPrimary>
+              <BtnSecondary onClick={onClose} disabled={previewing}>Cancel</BtnSecondary>
+            </div>
+          </>
         )}
 
-        <div className="flex gap-3 pt-2">
-          <BtnPrimary id="btn-do-import" onClick={submit} disabled={loading} className="flex-1">
-            <span className="flex items-center justify-center gap-2">
-              <Upload className="w-4 h-4" />
-              {loading ? "Importing…" : "Import Orders"}
-            </span>
-          </BtnPrimary>
-          <BtnSecondary onClick={onClose} disabled={loading}>Close</BtnSecondary>
-        </div>
+        {/* ── STEP 2: preview + commit ───────────────────────────── */}
+        {step === "preview" && preview && (
+          <PreviewPanel
+            preview={preview}
+            error={error}
+            committing={committing}
+            onBack={() => { setStep("choose"); setPreview(null); }}
+            onCommit={runCommit}
+          />
+        )}
+
+        {/* ── STEP 3: done ───────────────────────────────────────── */}
+        {step === "done" && committed && (
+          <div className="space-y-3">
+            <div className="bg-green-50 border-2 border-green-300 px-4 py-4 text-sm text-green-900">
+              <div className="font-bold flex items-center gap-2 text-base mb-1">
+                <CheckCircle2 className="w-5 h-5" /> Import committed
+              </div>
+              <div className="text-xs font-mono mb-1">batch: {committed.import_batch_id}</div>
+              <div className="grid grid-cols-3 gap-2 mt-3">
+                <MiniStat label="orders" value={committed.committed?.orders_created ?? 0} accent="#0F172A" />
+                <MiniStat label="items"  value={committed.committed?.items_created  ?? 0} accent="#C27842" />
+                <MiniStat label="exceptions" value={committed.committed?.exceptions_queued ?? 0} accent="#DC2626" />
+              </div>
+            </div>
+            <div className="flex gap-3">
+              <BtnSecondary onClick={reset}>
+                <ChevronLeft className="w-4 h-4 mr-1.5" /> Import another
+              </BtnSecondary>
+              <BtnPrimary onClick={onClose} className="flex-1">Close</BtnPrimary>
+            </div>
+          </div>
+        )}
       </div>
     </Drawer>
+  );
+}
+
+function MiniStat({ label, value, accent }) {
+  return (
+    <div className="border-2 border-neutral-200 bg-white px-3 py-2 relative overflow-hidden">
+      <div className="absolute left-0 top-0 bottom-0 w-1" style={{ background: accent }} />
+      <div className="text-[9px] uppercase tracking-wider font-bold text-slate-500">{label}</div>
+      <div className="font-mono text-xl font-bold">{value}</div>
+    </div>
+  );
+}
+
+function PreviewPanel({ preview, error, committing, onBack, onCommit }) {
+  const rows = preview.rows || [];
+  const stats = preview.stats || {};
+  const isPicklist = !!preview.is_picklist;
+
+  return (
+    <div className="space-y-4">
+      {/* Header meta */}
+      <div className="bg-slate-50 border-2 border-slate-200 px-4 py-3 text-xs text-slate-800 font-mono space-y-1">
+        <div>platform: <span className="font-bold">{preview.platform}</span></div>
+        <div>file: {preview.filename}</div>
+        {isPicklist && (
+          <div className="text-purple-700">
+            picklist_batch_id (from filename): <span className="font-bold">{preview.picklist_batch_id}</span>
+          </div>
+        )}
+        <div>header row (1-based): {preview.header_row_1_based}</div>
+      </div>
+
+      {/* Summary stats */}
+      <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+        <MiniStat label="total"       value={stats.total_rows_read     ?? 0} accent="#0F172A" />
+        <MiniStat label="matched"     value={stats.matched             ?? 0} accent="#16A34A" />
+        <MiniStat label="unmatched"   value={stats.unmatched           ?? 0} accent="#DC2626" />
+        <MiniStat label="order rows"  value={stats.order_style_rows    ?? 0} accent="#2563EB" />
+        <MiniStat label="picklist rows" value={stats.picklist_rows     ?? 0} accent="#7C3AED" />
+        <MiniStat label="distinct orders" value={stats.distinct_orders ?? 0} accent="#C27842" />
+      </div>
+
+      {(stats.derivation_failed > 0 || stats.empty_leaf_sku > 0) && (
+        <div className="bg-amber-50 border-2 border-amber-300 px-4 py-2 text-xs text-amber-900 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+          <div>
+            {stats.derivation_failed > 0 && <span className="mr-3">group_id derivation failed on <b>{stats.derivation_failed}</b> row(s).</span>}
+            {stats.empty_leaf_sku > 0 && <span>empty leaf_sku on <b>{stats.empty_leaf_sku}</b> row(s).</span>}
+            <span> These will go to the exception queue.</span>
+          </div>
+        </div>
+      )}
+
+      {/* Row preview table */}
+      <div className="border-2 border-slate-200 rounded overflow-hidden">
+        <div className="max-h-[420px] overflow-y-auto overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-100 sticky top-0 text-[10px] uppercase tracking-wider text-slate-600">
+              <tr>
+                <th className="text-left p-2 border-b">Row #</th>
+                <th className="text-left p-2 border-b">Type</th>
+                <th className="text-left p-2 border-b">Order / Batch</th>
+                <th className="text-left p-2 border-b">Raw leaf_sku</th>
+                <th className="text-left p-2 border-b">Group → size</th>
+                <th className="text-left p-2 border-b">Style code</th>
+                <th className="text-right p-2 border-b">Qty</th>
+                <th className="text-left p-2 border-b">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.slice(0, 300).map((r, i) => {
+                const isOrderRow    = !!r.order_id;
+                const isPicklistRow = !isOrderRow;
+                const matched       = !!r.matched;
+                return (
+                  <tr key={i} className={`border-b border-neutral-100 ${!matched ? "bg-red-50/40" : "hover:bg-slate-50"}`}>
+                    <td className="p-2 font-mono">{r.source_row_index}</td>
+                    <td className="p-2">
+                      {isOrderRow
+                        ? <Badge color="blue">order</Badge>
+                        : <Badge color="purple">picklist</Badge>}
+                    </td>
+                    <td className="p-2 font-mono">
+                      {isOrderRow
+                        ? r.order_id
+                        : <span className="text-purple-700">{r.picklist_batch_id || "—"}</span>}
+                    </td>
+                    <td className="p-2 font-mono">
+                      {r.leaf_sku_raw || "—"}
+                      {r.leaf_sku_stripped_prefix && (
+                        <span className="ml-1 text-[9px] text-amber-700 bg-amber-100 border border-amber-300 rounded px-1">
+                          -{r.leaf_sku_stripped_prefix}
+                        </span>
+                      )}
+                    </td>
+                    <td className="p-2 font-mono text-[11px]">
+                      {r.group_id || "—"}{" → "}{r.derived_size || r.size || "—"}
+                    </td>
+                    <td className="p-2 font-mono">{r.style_code || "—"}</td>
+                    <td className="p-2 font-mono text-right">{r.qty}</td>
+                    <td className="p-2">
+                      {matched ? (
+                        <Badge color="green">
+                          {r.match_via || "matched"}
+                        </Badge>
+                      ) : (
+                        <div className="text-red-700 text-[10px] leading-tight">
+                          <Badge color="red">exception</Badge>
+                          <div className="mt-1 max-w-[220px]">{r.exception_reason}</div>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {rows.length > 300 && (
+                <tr>
+                  <td colSpan={8} className="p-3 text-center text-xs text-slate-500 italic">
+                    Showing first 300 of {rows.length} rows. All rows will be committed.
+                  </td>
+                </tr>
+              )}
+              {rows.length === 0 && (
+                <tr>
+                  <td colSpan={8} className="p-6 text-center text-sm text-slate-400 italic">
+                    No rows parsed — check header row + column map.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {error && (
+        <div className="bg-red-50 border-2 border-red-300 px-4 py-3 text-sm text-red-700 font-semibold whitespace-pre-line">
+          {error}
+        </div>
+      )}
+
+      <div className="flex gap-3 pt-2 border-t border-slate-200">
+        <BtnSecondary onClick={onBack} disabled={committing}>
+          <ChevronLeft className="w-4 h-4 mr-1.5" /> Back
+        </BtnSecondary>
+        <BtnPrimary onClick={onCommit} disabled={committing || rows.length === 0} className="flex-1">
+          <span className="flex items-center justify-center gap-2">
+            <Upload className="w-4 h-4" />
+            {committing ? "Committing…" :
+             `Commit ${rows.length} row${rows.length !== 1 ? "s" : ""} → online_orders`}
+          </span>
+        </BtnPrimary>
+      </div>
+    </div>
   );
 }
 
@@ -169,11 +446,26 @@ export default function OnlineOrders() {
   const [loading, setLoading]   = useState(true);
   const [importOpen, setImportOpen] = useState(false);
 
-  // Filters
   const [filterChannel, setFilterChannel]   = useState("");
   const [filterStatus, setFilterStatus]     = useState("");
   const [filterFrom, setFilterFrom]         = useState("");
   const [filterTo, setFilterTo]             = useState("");
+
+  // channel filter is now derived from active configs so it stays in sync
+  const [channelOptions, setChannelOptions] = useState(["myntra", "flipkart", "nykaa", "website"]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await http.get("/order-import-format-configs?active=true");
+        const platforms = (r.data || []).map((c) => c.platform);
+        if (platforms.length) {
+          // Merge with defaults so legacy jobs still filterable
+          const merged = Array.from(new Set([...platforms, "myntra", "flipkart", "nykaa", "website"]));
+          setChannelOptions(merged);
+        }
+      } catch { /* keep defaults */ }
+    })();
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -191,7 +483,6 @@ export default function OnlineOrders() {
 
   useEffect(() => { load(); }, [load]);
 
-  // Summary stats
   const stats = jobs.reduce(
     (acc, j) => {
       acc.total++;
@@ -207,15 +498,22 @@ export default function OnlineOrders() {
     <div className="min-h-screen bg-[#F7F7F5]">
       <PageHeader
         title="Online Orders"
-        subtitle="Channel Imports"
+        subtitle="Config-driven marketplace order & picklist imports"
         testId="online-orders-header"
         action={
           <div className="flex gap-2">
+            <Link to="/order-import-formats">
+              <BtnSecondary id="btn-import-formats">
+                <span className="flex items-center gap-1.5">
+                  <Settings2 className="w-4 h-4" /> Formats
+                </span>
+              </BtnSecondary>
+            </Link>
             <BtnSecondary id="btn-refresh-orders" onClick={load}>
               <span className="flex items-center gap-1.5"><RefreshCw className="w-4 h-4" /> Refresh</span>
             </BtnSecondary>
             <BtnPrimary id="btn-import-orders" onClick={() => setImportOpen(true)}>
-              <span className="flex items-center gap-2"><Upload className="w-4 h-4" /> Import CSV</span>
+              <span className="flex items-center gap-2"><Upload className="w-4 h-4" /> Import orders</span>
             </BtnPrimary>
           </div>
         }
@@ -243,7 +541,7 @@ export default function OnlineOrders() {
           <Select label="Channel" id="filter-channel" value={filterChannel}
             onChange={(e) => setFilterChannel(e.target.value)}>
             <option value="">All Channels</option>
-            {CHANNELS.map((c) => <option key={c} value={c}>{c.charAt(0).toUpperCase() + c.slice(1)}</option>)}
+            {channelOptions.map((c) => <option key={c} value={c}>{c.charAt(0).toUpperCase() + c.slice(1)}</option>)}
           </Select>
         </div>
         <div className="w-40">
@@ -278,9 +576,9 @@ export default function OnlineOrders() {
           <Card className="p-10 text-center">
             <ShoppingBag className="w-10 h-10 text-slate-300 mx-auto mb-3" />
             <div className="text-slate-500 font-semibold mb-1">No online orders found</div>
-            <div className="text-xs text-slate-400 mb-4">Import a CSV to get started.</div>
+            <div className="text-xs text-slate-400 mb-4">Import a marketplace order or picklist file to get started.</div>
             <BtnPrimary onClick={() => setImportOpen(true)}>
-              <span className="flex items-center gap-2"><Upload className="w-4 h-4" /> Import CSV</span>
+              <span className="flex items-center gap-2"><Upload className="w-4 h-4" /> Import orders</span>
             </BtnPrimary>
           </Card>
         ) : (
