@@ -6407,6 +6407,375 @@ async def reconciliation_summary(
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# ══ ONLINE PROFITABILITY (Phase 4 — Cost vs Revenue reconciliation) ════
+# ═══════════════════════════════════════════════════════════════════════
+# The actual profit engine — net cost of goods actually sold against
+# what was actually received for them, per period/platform/style.
+#
+#   Step A — Net units sold: online_order_items where is_net_sold=true
+#             (produced by Phase 2 classification).
+#   Step B — Net COGS: existing compute_style_costing().total_cost per unit
+#             × units_sold, summed across styles. Uses the SAME costing
+#             engine as B2B — one source of truth.
+#   Step C — Revenue received: sum of Settled_Amount over forward_settled
+#             minus reverse_settled (Phase 3 collections).
+#   Step D — Revenue pending: same shape but against unsettled sheets.
+#   Step E — Platform fees: commission + fixed_fee + logistics_cost +
+#             pick_and_pack_fee + tech_enablement + royalty, forward
+#             minus reverse.
+#   Step F — Cost of returns (logistics): the reverse-side of platform
+#             fees, surfaced separately so RTO / return logistics drag
+#             is visible even though the inventory itself came back.
+#
+# Graceful degradation: if Phase 3 settlement collections don't exist
+# yet, C/D/E/F return 0 (with `notes.phase_3_available=false` set).
+# The moment Phase 3 lands, numbers flow without any code change here.
+# ═══════════════════════════════════════════════════════════════════════
+
+# Documented map: canonical fee key → collection column name(s) we sum.
+# Kept as a config so Phase 3's actual column names can be finalised
+# without touching this endpoint's logic.
+_PLATFORM_FEE_FIELDS = [
+    "commission_amount_incl_gst_postpaid", "commission_amount_incl_gst_prepaid",
+    "fixed_fee_postpaid",                  "fixed_fee_prepaid",
+    "logistics_cost_forward_incl_tax_postpaid", "logistics_cost_forward_incl_tax_prepaid",
+    "pick_and_pack_fees_postpaid",         "pick_and_pack_fees_prepaid",
+    "tech_enablement_charges_postpaid",    "tech_enablement_charges_prepaid",
+    "royalty_charges_postpaid",            "royalty_charges_prepaid",
+]
+
+# Logistics-only subset (used for Step F — cost of returns logistics).
+_LOGISTICS_FEE_FIELDS = [
+    "logistics_cost_forward_incl_tax_postpaid", "logistics_cost_forward_incl_tax_prepaid",
+    "logistics_cost_reverse_incl_tax_postpaid", "logistics_cost_reverse_incl_tax_prepaid",
+]
+
+# Amount columns we treat as "revenue received" on the forward side and
+# "revenue clawback" on the reverse side.
+_SETTLED_AMOUNT_FIELDS = ["settled_amount_postpaid", "settled_amount_prepaid"]
+_PENDING_AMOUNT_FIELDS = [
+    "amount_pending_settlement_postpaid",
+    "amount_pending_settlement_prepaid",
+]
+
+
+async def _collection_exists(name: str) -> bool:
+    """True iff a MongoDB collection with this name exists."""
+    try:
+        names = await db.list_collection_names()
+        return name in names
+    except Exception:
+        return False
+
+
+async def _sum_settlement_fields(
+    coll_name: str,
+    fields: List[str],
+    match: Dict[str, Any],
+) -> float:
+    """Sum a list of numeric columns across all matching docs in the
+    given settlement collection.  Returns 0.0 if the collection doesn't
+    exist yet (Phase 3 not built) or if no rows match.  Missing / non-
+    numeric per-doc values are treated as 0.
+    """
+    if not await _collection_exists(coll_name):
+        return 0.0
+    coll = db[coll_name]
+    # Build $sum expressions coercing missing/null → 0.
+    sum_exprs = {
+        "total": {"$sum": {
+            "$add": [
+                {"$ifNull": [f"${f}", 0]}
+                for f in fields
+            ]
+        }}
+    } if fields else {"total": {"$sum": 0}}
+    try:
+        pipeline = [
+            {"$match": match},
+            {"$group": {"_id": None, **sum_exprs}},
+        ]
+        agg = await coll.aggregate(pipeline).to_list(1)
+        if not agg: return 0.0
+        return float(agg[0].get("total") or 0.0)
+    except Exception as e:
+        log.warning(f"_sum_settlement_fields failed on {coll_name}: {e}")
+        return 0.0
+
+
+def _build_settlement_match(
+    platform: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    style_id: Optional[str],
+) -> Dict[str, Any]:
+    """Match filter used against every settlement collection. Uses
+    packing_date/delivery_date range on the settlement rows (Phase 3
+    will normalise these), and matches platform when supplied.
+    """
+    q: Dict[str, Any] = {}
+    if platform: q["platform"] = platform.lower()
+    if style_id: q["style_id"] = style_id
+    if date_from or date_to:
+        rng: Dict[str, Any] = {}
+        if date_from: rng["$gte"] = date_from
+        if date_to:   rng["$lte"] = date_to
+        # Match the packing/delivery date (Phase 3 will populate these on
+        # settlement docs). Row is included if EITHER falls in range so
+        # that late-arriving settlements for a June packing still land
+        # in the June report.
+        q["$or"] = [{"packing_date": rng}, {"delivery_date": rng}]
+    return q
+
+
+@api.get("/reports/online-profitability")
+async def online_profitability(
+    request: Request,
+    platform: Optional[str] = None,
+    date_from: Optional[str] = Query(None, description="YYYY-MM-DD (inclusive)"),
+    date_to:   Optional[str] = Query(None, description="YYYY-MM-DD (inclusive)"),
+    style_id:  Optional[str] = None,
+    materialise: bool = Query(False, description="If true, also upsert into online_profitability_daily"),
+):
+    """Cost of Production vs Revenue Reconciliation Engine.
+
+    Returns net units sold, total net COGS, revenue settled/pending,
+    platform fees, cost of returns logistics, gross profit + margin,
+    and a per-style breakdown with return rate.
+    """
+    await get_current_user(request)
+
+    notes: List[str] = []
+
+    # ── Build item-level match (Phase 2 output) ──
+    item_match: Dict[str, Any] = {}
+    if platform: item_match["platform"] = platform.lower()
+    if style_id:
+        try: item_match["style_id"] = ObjectId(style_id)
+        except Exception: item_match["style_id"] = style_id
+    if date_from or date_to:
+        rng: Dict[str, Any] = {}
+        if date_from: rng["$gte"] = date_from
+        if date_to:   rng["$lte"] = date_to
+        item_match["packed_on"] = rng
+
+    # ── STEP A — Net units sold (grouped by style) ──
+    sold_pipeline = [
+        {"$match": {**item_match, "is_net_sold": True}},
+        {"$group": {
+            "_id":         "$style_id",
+            "style_code":  {"$first": "$style_code"},
+            "color":       {"$first": "$color"},
+            "units_sold":  {"$sum": {"$ifNull": ["$qty", 1]}},
+            # Item-file revenue is a fallback when settlements aren't yet imported.
+            "item_final_amount": {"$sum": {"$ifNull": ["$final_amount", 0]}},
+        }},
+    ]
+    sold_rows = await db.online_order_items.aggregate(sold_pipeline).to_list(2000)
+
+    # ── Returned units (for return_rate_pct in by_style) ──
+    ret_pipeline = [
+        {"$match": {**item_match, "was_returned_to_stock": True}},
+        {"$group": {"_id": "$style_id", "returned_units": {"$sum": {"$ifNull": ["$qty", 1]}}}},
+    ]
+    ret_rows = await db.online_order_items.aggregate(ret_pipeline).to_list(2000)
+    returned_by_style = {str(r["_id"]): r["returned_units"] for r in ret_rows if r.get("_id")}
+
+    # ── STEP B — COGS per style (from the SAME costing engine used by B2B) ──
+    style_ids = [r["_id"] for r in sold_rows if r.get("_id")]
+    style_cost_map: Dict[str, Dict[str, Any]] = {}
+    if style_ids:
+        style_docs = await db.styles.find({"_id": {"$in": style_ids}}).to_list(len(style_ids))
+        for s in style_docs:
+            try:
+                c = compute_style_costing(s)
+                style_cost_map[str(s["_id"])] = {
+                    "style_code": s.get("code") or s.get("style_code"),
+                    "unit_cogs":  c.get("total_cost") or 0,
+                    "materials_cost": c.get("materials_cost"),
+                    "labor_cost":     c.get("labor_cost"),
+                    "overhead_cost":  c.get("overhead_cost"),
+                    "packing_cost":   c.get("packing_cost"),
+                }
+            except Exception as e:
+                log.warning(f"compute_style_costing failed for style {s.get('_id')}: {e}")
+                style_cost_map[str(s["_id"])] = {"style_code": s.get("code"), "unit_cogs": 0}
+        missing = [str(sid) for sid in style_ids if str(sid) not in style_cost_map]
+        if missing:
+            notes.append(f"{len(missing)} style_id(s) referenced by net-sold rows have no styles doc — COGS treated as 0 for these.")
+
+    # ── STEPS C, D, E, F — settlement-derived numbers ──
+    settle_match = _build_settlement_match(platform, date_from, date_to, style_id)
+
+    fwd_exists = await _collection_exists("settlement_forward")
+    rev_exists = await _collection_exists("settlement_reverse")
+    fwd_un_exists = await _collection_exists("settlement_unsettled_forward")
+    rev_un_exists = await _collection_exists("settlement_unsettled_reverse")
+    phase_3_available = (fwd_exists or rev_exists or fwd_un_exists or rev_un_exists)
+
+    if not phase_3_available:
+        notes.append(
+            "Phase 3 settlement import has not been run yet — revenue_settled, "
+            "revenue_pending, platform_fees and cost_of_returns_logistics are "
+            "all 0. Import forward_settled / reverse_settled / forward_unsettled "
+            "/ reverse_unsettled to populate these figures."
+        )
+
+    # STEP C: revenue settled = forward − reverse
+    revenue_forward = await _sum_settlement_fields("settlement_forward", _SETTLED_AMOUNT_FIELDS, settle_match)
+    revenue_reverse = await _sum_settlement_fields("settlement_reverse", _SETTLED_AMOUNT_FIELDS, settle_match)
+    total_revenue_settled = revenue_forward - revenue_reverse
+
+    # STEP D: revenue pending = unsettled forward − unsettled reverse
+    pending_forward = await _sum_settlement_fields("settlement_unsettled_forward", _PENDING_AMOUNT_FIELDS, settle_match)
+    pending_reverse = await _sum_settlement_fields("settlement_unsettled_reverse", _PENDING_AMOUNT_FIELDS, settle_match)
+    total_revenue_pending = pending_forward - pending_reverse
+
+    # STEP E: platform fees = forward − reverse across all fee columns
+    fees_forward_settled     = await _sum_settlement_fields("settlement_forward",            _PLATFORM_FEE_FIELDS, settle_match)
+    fees_reverse_settled     = await _sum_settlement_fields("settlement_reverse",            _PLATFORM_FEE_FIELDS, settle_match)
+    fees_forward_unsettled   = await _sum_settlement_fields("settlement_unsettled_forward",  _PLATFORM_FEE_FIELDS, settle_match)
+    fees_reverse_unsettled   = await _sum_settlement_fields("settlement_unsettled_reverse",  _PLATFORM_FEE_FIELDS, settle_match)
+    total_platform_fees = (
+        fees_forward_settled + fees_forward_unsettled
+        - fees_reverse_settled - fees_reverse_unsettled
+    )
+
+    # STEP F: cost of returns logistics — the REVERSE-side logistics rows.
+    # Reverse rows come with positive amounts (a fee we paid) so we take
+    # the raw sum, not forward-minus-reverse.
+    cost_of_returns_logistics = (
+        await _sum_settlement_fields("settlement_reverse",           _LOGISTICS_FEE_FIELDS, settle_match)
+      + await _sum_settlement_fields("settlement_unsettled_reverse", _LOGISTICS_FEE_FIELDS, settle_match)
+    )
+
+    # ── Assemble per-style breakdown ──
+    by_style: List[Dict[str, Any]] = []
+    total_units_sold  = 0
+    total_net_cogs    = 0.0
+    total_item_revenue_fallback = 0.0
+    for r in sold_rows:
+        sid = r.get("_id")
+        sid_str = str(sid) if sid else None
+        units_sold = int(r.get("units_sold") or 0)
+        returned_units = int(returned_by_style.get(sid_str, 0)) if sid_str else 0
+        unit_cogs = float(style_cost_map.get(sid_str, {}).get("unit_cogs", 0)) if sid_str else 0.0
+        style_cogs = unit_cogs * units_sold
+        item_revenue = float(r.get("item_final_amount") or 0)
+
+        # Denominator = returned + net_sold (as per spec)
+        total_touch = returned_units + units_sold
+        return_rate = (returned_units / total_touch * 100) if total_touch > 0 else 0.0
+
+        by_style.append({
+            "style_id":        sid_str,
+            "style_code":      style_cost_map.get(sid_str, {}).get("style_code") or r.get("style_code"),
+            "color":           r.get("color"),
+            "units_sold":      units_sold,
+            "returned_units":  returned_units,
+            "unit_cogs":       round(unit_cogs, 2),
+            "cogs":            round(style_cogs, 2),
+            "item_revenue_fallback": round(item_revenue, 2),   # from final_amount
+            "return_rate_pct": round(return_rate, 2),
+        })
+        total_units_sold += units_sold
+        total_net_cogs   += style_cogs
+        total_item_revenue_fallback += item_revenue
+
+    # If Phase 3 isn't up, use the item-file's `final_amount` as a
+    # best-effort revenue signal so the profit line isn't outright 0.
+    revenue_used_for_profit = total_revenue_settled
+    revenue_source = "settlement_forward - settlement_reverse"
+    if not phase_3_available and total_item_revenue_fallback > 0:
+        revenue_used_for_profit = total_item_revenue_fallback
+        revenue_source = "online_order_items.final_amount (fallback while Phase 3 not imported)"
+        notes.append("Using item-file final_amount as revenue signal since Phase 3 settlements aren't imported yet.")
+
+    # Gross profit computed against whichever revenue signal we have
+    gross_profit = revenue_used_for_profit - total_net_cogs
+    gross_margin_pct = ((gross_profit / revenue_used_for_profit) * 100) if revenue_used_for_profit else 0.0
+
+    # Per-style profit (only meaningful once Phase 3 is up; before then
+    # we allocate item_revenue_fallback proportionally).
+    for row in by_style:
+        row_rev = 0.0
+        if phase_3_available:
+            # We don't (yet) have per-style settlement joins, so leave
+            # revenue_settled 0 at row level — total is reported above.
+            # A future refinement will do per-style joins via
+            # settlement.style_id when Phase 3 populates it.
+            row_rev = 0.0
+        else:
+            row_rev = float(row.get("item_revenue_fallback") or 0)
+        row["revenue_settled"] = round(row_rev, 2)
+        row["profit"]          = round(row_rev - row["cogs"], 2)
+        row["margin_pct"]      = round(((row["profit"] / row_rev) * 100) if row_rev else 0.0, 2)
+
+    # ── Platform-fees interpretation note (from spec) ──
+    notes.append(
+        "Platform fees interpretation: Myntra typically nets platform fees "
+        "OUT of Settled_Amount BEFORE reporting it. So `total_platform_fees` "
+        "here is INFORMATIONAL — do NOT subtract it again from "
+        "total_revenue_settled. Validate on a sample row that Settled_Amount "
+        "+ Sum(fees) ≈ Customer_Paid_Amount before changing this "
+        "assumption. Phase 3 will surface both interpretations side-by-side."
+    )
+
+    result = {
+        "period":                    {"from": date_from, "to": date_to},
+        "platform":                  platform,
+        "style_id":                  style_id,
+        "net_units_sold":            total_units_sold,
+        "total_net_cogs":            round(total_net_cogs, 2),
+        "total_revenue_settled":     round(total_revenue_settled, 2),
+        "total_revenue_pending":     round(total_revenue_pending, 2),
+        "total_platform_fees":       round(total_platform_fees, 2),
+        "cost_of_returns_logistics": round(cost_of_returns_logistics, 2),
+        "gross_profit":              round(gross_profit, 2),
+        "gross_margin_pct":          round(gross_margin_pct, 2),
+        "revenue_source_used":       revenue_source,
+        "phase_3_available":         phase_3_available,
+        "notes":                     notes,
+        "by_style":                  by_style,
+    }
+
+    # ── Optional materialisation to online_profitability_daily ──
+    if materialise:
+        key = {
+            "platform":  platform,
+            "date_from": date_from,
+            "date_to":   date_to,
+            "style_id":  style_id,
+        }
+        await db.online_profitability_daily.update_one(
+            key,
+            {"$set": {**key, **result, "computed_at": now_iso()}},
+            upsert=True,
+        )
+        result["materialised"] = True
+
+    return result
+
+
+@api.get("/reports/online-profitability-materialised")
+async def list_materialised_profitability(
+    request: Request,
+    platform: Optional[str] = None,
+    limit: int = 50,
+):
+    """List previously-materialised profitability snapshots. Useful for
+    dashboards that need fast reads without recomputing.
+    """
+    await get_current_user(request)
+    q: Dict[str, Any] = {}
+    if platform: q["platform"] = platform.lower()
+    docs = await db.online_profitability_daily.find(q).sort("computed_at", -1).limit(limit).to_list(limit)
+    for d in docs: d.pop("_id", None)
+    return docs
+
+
+
 
 
 # ---------- COSTING (live preview) ----------
