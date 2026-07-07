@@ -5275,6 +5275,479 @@ async def import_online_orders_configured(
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# ══ DISPATCH IMPORT (Phase H — daily "what got packed today") ══════════
+# ═══════════════════════════════════════════════════════════════════════
+# Uses the same order_import_format_configs collection with role="dispatch".
+# Each parsed row → 1 unit dispatched → decrement ready_stock_qty and,
+# if a prior reservation exists for that (order_release_id, style, color,
+# size), release it. If no reservation exists (Myntra's dispatch file is
+# often the FIRST record of a unit), an implicit "reserved" movement is
+# posted first so the inventory ledger stays honest.
+# ═══════════════════════════════════════════════════════════════════════
+
+async def _parse_and_resolve_dispatch_row(
+    raw_row: dict,
+    cfg: dict,
+    platform: str,
+    source_row_index: int,
+) -> dict:
+    """Parse one row of a dispatch file into canonical form + resolve style.
+
+    Mirrors _parse_and_resolve_order_row() but for dispatch canonical
+    fields. Reuses the SAME normalisation pipeline (strip_excel_apostrophe
+    → apply_prefix_replacements → strip_known_prefixes → split_leaf_sku →
+    resolve_style) so there's no second parser to maintain.
+    """
+    column_map: Dict[str, Optional[str]] = cfg.get("column_map") or {}
+    prefixes     = cfg.get("known_sku_prefixes_to_strip") or []
+    replacements = cfg.get("known_sku_prefix_replacements") or {}
+
+    def _v(canon_key: str):
+        col = column_map.get(canon_key)
+        return raw_row.get(col) if col else None
+
+    canon: Dict[str, Any] = {
+        "source_row_index": source_row_index,
+        "platform":         platform,
+        "raw_row":          {k: (str(v) if v is not None else "") for k, v in raw_row.items()},
+        "flags":            [],
+        "matched":          False,
+    }
+
+    # Header identifiers — order_id + order_release_id.
+    order_id = str(_v("order_id") or "").strip()
+    order_release_id = str(_v("order_release_id") or "").strip()
+    canon["order_id"] = order_id or None
+    canon["order_release_id"] = order_release_id or None
+
+    # Descriptive channel-side fields
+    canon["channel_sku"]         = str(_v("channel_sku") or "").strip() or None
+    canon["packed_on"]           = str(_v("packed_on") or "").strip() or None
+    canon["status"]              = str(_v("status") or "").strip() or None
+    canon["tracking_id"]         = str(_v("tracking_id") or "").strip() or None
+    canon["destination_city"]    = str(_v("destination_city") or "").strip() or None
+    canon["destination_state"]   = str(_v("destination_state") or "").strip() or None
+    canon["destination_pincode"] = str(_v("destination_pincode") or "").strip() or None
+    canon["store_packet_id"]     = str(_v("store_packet_id") or "").strip() or None
+    canon["product_title"]       = str(_v("product_title") or "").strip() or None
+
+    def _num(x) -> Optional[float]:
+        try:
+            s = str(x or "").strip()
+            if not s: return None
+            return float(s)
+        except Exception:
+            return None
+    canon["mrp"]           = _num(_v("mrp"))
+    canon["selling_value"] = _num(_v("selling_value"))
+    canon["cgst"]          = _num(_v("cgst"))
+    canon["sgst"]          = _num(_v("sgst"))
+    canon["igst"]          = _num(_v("igst"))
+
+    # qty — dispatch files default to 1 unit per row unless the file
+    # explicitly maps a qty column.
+    qty_raw = _v("qty")
+    try:
+        qty = int(float(str(qty_raw or "1").strip() or "1"))
+        if qty <= 0: qty = 1
+    except Exception:
+        qty = 1
+    canon["qty"] = qty
+
+    # ── leaf_sku normalisation (identical pipeline to order-import) ──
+    leaf_raw = str(_v("leaf_sku") or "").strip()
+    canon["leaf_sku_raw"] = leaf_raw
+    if not leaf_raw:
+        canon["flags"].append("empty_leaf_sku")
+        canon["leaf_sku"] = ""
+        canon["leaf_sku_replaced_prefix"] = None
+        canon["leaf_sku_stripped_prefix"] = None
+        canon["exception_reason"] = "leaf_sku column is empty"
+        return canon
+
+    leaf = strip_excel_apostrophe(leaf_raw)
+    leaf_after_replace, replaced_from = apply_prefix_replacements(leaf, replacements)
+    leaf_stripped, matched_prefix = strip_known_prefixes(leaf_after_replace, prefixes)
+    canon["leaf_sku_replaced_prefix"] = replaced_from
+    canon["leaf_sku_stripped_prefix"] = matched_prefix
+    canon["leaf_sku"] = leaf_stripped
+
+    group_id, size_tok, split_flags = split_leaf_sku(leaf_stripped)
+    canon["group_id"]     = group_id
+    canon["derived_size"] = size_tok
+    canon["flags"].extend(split_flags)
+
+    if not group_id or not size_tok:
+        canon["exception_reason"] = f"could not split leaf_sku '{leaf_stripped}' into group+size"
+        return canon
+
+    # Try both leaf and group candidates via sku_map (same pattern as order-import)
+    resolved = {"matched": False, "match_via": None}
+    for candidate in (leaf_stripped, group_id):
+        if not candidate:
+            continue
+        r = await resolve_style(
+            source_type="online_channel",
+            source_name=platform,
+            external_sku=candidate,
+        )
+        if r.get("matched"):
+            resolved = r
+            break
+    canon.update({
+        "matched":       bool(resolved.get("matched")),
+        "match_via":     resolved.get("match_via"),
+        "style_id":      resolved.get("style_id"),
+        "style_code":    resolved.get("style_code"),
+        "color":         resolved.get("color") or "",
+        "size":          resolved.get("size") or size_tok,
+    })
+    if not canon["matched"]:
+        canon["exception_reason"] = resolved.get("reason") or "no style match in sku_map"
+    return canon
+
+
+async def _dispatch_one_unit(
+    *,
+    style_id: str,
+    style_code: str,
+    color: str,
+    size: str,
+    online_order_id: Optional[str],
+    reference_id: str,
+    notes: str,
+    user_email: str,
+) -> Dict[str, Any]:
+    """Post a 'dispatched' fg_stock_movement for exactly 1 unit.
+
+    If NO active reservation exists for the (online_order_id, style,
+    color, size) tuple, an implicit 'reserved' movement is posted first
+    so that the subsequent 'dispatched' delta (-1 reserved, -1 ready)
+    doesn't push reserved_qty below zero. Keeps the ledger honest for
+    first-time Myntra dispatches where the unit was never explicitly
+    reserved.
+    """
+    fg_row = await db.fg_inventory.find_one({
+        "style_id": ObjectId(style_id), "color": color, "size": size,
+    })
+    ready_qty = int((fg_row or {}).get("ready_stock_qty", 0))
+
+    if online_order_id:
+        existing_res = await db.inventory_reservations.find_one({
+            "online_order_id": online_order_id,
+            "style_id":        ObjectId(style_id),
+            "color":           color,
+            "size":            size,
+            "status":          "active",
+        })
+    else:
+        existing_res = None
+
+    outcome = {"implicit_reserve": False, "dispatched": False}
+
+    if not existing_res:
+        if ready_qty < 1:
+            raise HTTPException(
+                400,
+                f"Insufficient ready_stock_qty (have {ready_qty}) for "
+                f"{style_code} / {color} / {size} — cannot implicit-reserve for dispatch."
+            )
+        await _apply_movement(
+            FgStockMovementIn(
+                style_id=style_id, color=color, size=size,
+                movement_type="reserved", quantity=1,
+                reference_type="online_order" if online_order_id else "manual",
+                reference_id=reference_id,
+                notes=f"implicit reserve for dispatch — {notes}",
+                online_order_id=online_order_id,
+            ),
+            user_email,
+        )
+        outcome["implicit_reserve"] = True
+
+    await _apply_movement(
+        FgStockMovementIn(
+            style_id=style_id, color=color, size=size,
+            movement_type="dispatched", quantity=1,
+            reference_type="online_order" if online_order_id else "manual",
+            reference_id=reference_id, notes=notes,
+            online_order_id=online_order_id,
+        ),
+        user_email,
+    )
+    outcome["dispatched"] = True
+    return outcome
+
+
+@api.post("/online-orders/dispatch-import")
+async def import_dispatch_configured(
+    request: Request,
+    file: UploadFile = File(...),
+    platform: str = Query(..., description="e.g. 'myntra'"),
+    dry_run: bool = Query(True, description="Preview parse without touching inventory"),
+):
+    """Config-driven DISPATCH import (Phase H).
+
+    - platform : looked up in order_import_format_configs (role="dispatch")
+    - dry_run  : true → parse + resolve + would-succeed check, NO writes
+                 false → also post fg_stock_movements + upsert online_orders
+
+    Each row = 1 unit's worth of dispatch → decrement ready_stock_qty
+    (and release matching reservation) OR flag as exception if
+    inventory is insufficient / SKU unresolved.
+    """
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+
+    platform_lc = (platform or "").strip().lower()
+    cfg_doc = await db.order_import_format_configs.find_one(
+        {"platform": platform_lc, "role": "dispatch"}
+    )
+    if not cfg_doc:
+        raise HTTPException(
+            400,
+            f"No dispatch-import config for platform '{platform_lc}'. "
+            "Create one via POST /api/order-import-format-configs with role='dispatch' first."
+        )
+    if not cfg_doc.get("active", True):
+        raise HTTPException(400, f"Dispatch-import config for '{platform_lc}' is inactive.")
+
+    cfg = stringify(cfg_doc)
+
+    content = await file.read()
+    filename = file.filename or "upload"
+
+    try:
+        wb = _read_workbook_or_csv(content, filename)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Could not read file: {e}")
+
+    ws, header_row_1, header = _resolve_data_sheet_and_header(wb, cfg)
+    skip_after = int(cfg.get("skip_rows_after_header") or 0)
+    data_start_row = header_row_1 + 1 + skip_after
+
+    raw_rows: List[Dict[str, Any]] = []
+    for r in range(data_start_row, ws.max_row + 1):
+        row_cells = ws[r]
+        vals = {header[i]: (row_cells[i].value if i < len(row_cells) else None)
+                for i in range(len(header)) if header[i]}
+        if not any((v not in (None, "", " ")) for v in vals.values()):
+            continue
+        raw_rows.append(vals)
+
+    canonical_rows: List[Dict[str, Any]] = []
+    for idx, raw in enumerate(raw_rows, start=data_start_row):
+        canon = await _parse_and_resolve_dispatch_row(raw, cfg, platform_lc, idx)
+        canonical_rows.append(canon)
+
+    stats = {
+        "total_rows_read":         len(canonical_rows),
+        "matched":                 sum(1 for c in canonical_rows if c.get("matched")),
+        "unmatched":               sum(1 for c in canonical_rows if not c.get("matched")),
+        "empty_leaf_sku":          sum(1 for c in canonical_rows if "empty_leaf_sku" in (c.get("flags") or [])),
+        "distinct_order_releases": len({c.get("order_release_id") for c in canonical_rows if c.get("order_release_id")}),
+    }
+
+    import_batch_id = f"DISP_{platform_lc}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    committed: Dict[str, int] = {
+        "movements_posted":   0,
+        "implicit_reserves":  0,
+        "already_dispatched": 0,
+        "orders_upserted":    0,
+        "items_upserted":     0,
+        "exceptions_queued":  0,
+    }
+
+    if not dry_run:
+        exceptions: List[Dict[str, Any]] = []
+        for canon in canonical_rows:
+            src_row = canon.get("source_row_index")
+            order_release_id = canon.get("order_release_id")
+            order_id         = canon.get("order_id")
+
+            if not canon.get("matched") or "empty_leaf_sku" in (canon.get("flags") or []):
+                exceptions.append({
+                    "import_batch_id":  import_batch_id,
+                    "platform":         platform_lc,
+                    "kind":             "dispatch_import",
+                    "source_row_index": src_row,
+                    "order_id":         order_id,
+                    "order_release_id": order_release_id,
+                    "leaf_sku_raw":     canon.get("leaf_sku_raw"),
+                    "leaf_sku":         canon.get("leaf_sku"),
+                    "reason":           canon.get("exception_reason") or "unresolved",
+                    "flags":            canon.get("flags"),
+                    "raw_row":          canon.get("raw_row"),
+                    "created_at":       now_iso(),
+                    "resolved":         False,
+                })
+                continue
+
+            style_id   = canon["style_id"]
+            style_code = canon["style_code"]
+            color      = canon["color"]
+            size       = canon["size"]
+            qty        = int(canon.get("qty") or 1)
+
+            match_q: Dict[str, Any] = {"platform": platform_lc}
+            if order_release_id:
+                match_q["order_release_id"] = order_release_id
+            elif order_id:
+                match_q["order_id"] = order_id
+
+            existing_order = await db.online_orders.find_one(match_q) if len(match_q) > 1 else None
+            if existing_order is None:
+                new_order = {
+                    "platform":            platform_lc,
+                    "order_id":            order_id,
+                    "order_release_id":    order_release_id,
+                    "channel":             platform_lc,
+                    "order_status":        "dispatched",
+                    "source":              "dispatch_import",
+                    "packed_on":           canon.get("packed_on"),
+                    "tracking_id":         canon.get("tracking_id"),
+                    "destination_city":    canon.get("destination_city"),
+                    "destination_state":   canon.get("destination_state"),
+                    "destination_pincode": canon.get("destination_pincode"),
+                    "buyer_name":          None,
+                    "import_batch_id":     import_batch_id,
+                    "created_at":          now_iso(),
+                    "updated_at":          now_iso(),
+                }
+                res = await db.online_orders.insert_one(new_order)
+                online_order_pk = str(res.inserted_id)
+                committed["orders_upserted"] += 1
+            else:
+                online_order_pk = str(existing_order["_id"])
+                await db.online_orders.update_one(
+                    {"_id": existing_order["_id"]},
+                    {"$set": {
+                        "order_status":  "dispatched",
+                        "packed_on":     canon.get("packed_on") or existing_order.get("packed_on"),
+                        "tracking_id":   canon.get("tracking_id") or existing_order.get("tracking_id"),
+                        "updated_at":    now_iso(),
+                    }}
+                )
+
+            item_q: Dict[str, Any] = {
+                "online_order_id": ObjectId(online_order_pk),
+                "style_id":        ObjectId(style_id),
+                "color":           color,
+                "size":            size,
+            }
+            existing_item = await db.online_order_items.find_one(item_q)
+            if existing_item and (existing_item.get("stage") == "dispatched" or existing_item.get("dispatched_at")):
+                committed["already_dispatched"] += 1
+                canon["_committed"] = {"already_dispatched": True}
+                continue
+
+            posted = 0; implicit = 0
+            try:
+                for _ in range(qty):
+                    outcome = await _dispatch_one_unit(
+                        style_id=style_id, style_code=style_code, color=color, size=size,
+                        online_order_id=online_order_pk,
+                        reference_id=order_release_id or order_id or import_batch_id,
+                        notes=f"{platform_lc} dispatch import · row {src_row}"
+                              + (f" · tracking {canon.get('tracking_id')}" if canon.get('tracking_id') else ""),
+                        user_email=u["email"],
+                    )
+                    posted += 1
+                    if outcome["implicit_reserve"]:
+                        implicit += 1
+            except HTTPException as he:
+                exceptions.append({
+                    "import_batch_id":  import_batch_id,
+                    "platform":         platform_lc,
+                    "kind":             "dispatch_import",
+                    "source_row_index": src_row,
+                    "order_id":         order_id,
+                    "order_release_id": order_release_id,
+                    "style_id":         style_id,
+                    "style_code":       style_code,
+                    "color":            color,
+                    "size":             size,
+                    "leaf_sku":         canon.get("leaf_sku"),
+                    "reason":           f"movement blocked: {he.detail}",
+                    "raw_row":          canon.get("raw_row"),
+                    "created_at":       now_iso(),
+                    "resolved":         False,
+                })
+                canon["_committed"] = {"error": str(he.detail)}
+                continue
+
+            committed["movements_posted"]  += posted
+            committed["implicit_reserves"] += implicit
+
+            item_doc = {
+                "online_order_id":  ObjectId(online_order_pk),
+                "platform":         platform_lc,
+                "order_id":         order_id,
+                "order_release_id": order_release_id,
+                "style_id":         ObjectId(style_id),
+                "style_code":       style_code,
+                "color":            color,
+                "size":             size,
+                "leaf_sku":         canon.get("leaf_sku"),
+                "leaf_sku_raw":     canon.get("leaf_sku_raw"),
+                "channel_sku":      canon.get("channel_sku"),
+                "qty":              qty,
+                "stage":            "dispatched",
+                "packed_on":        canon.get("packed_on"),
+                "dispatched_at":    now_iso(),
+                "tracking_id":      canon.get("tracking_id"),
+                "store_packet_id":  canon.get("store_packet_id"),
+                "mrp":              canon.get("mrp"),
+                "selling_value":    canon.get("selling_value"),
+                "import_batch_id":  import_batch_id,
+                "source":           "dispatch_import",
+            }
+            if existing_item:
+                await db.online_order_items.update_one(
+                    {"_id": existing_item["_id"]},
+                    {"$set": {**item_doc, "updated_at": now_iso()}}
+                )
+            else:
+                item_doc["created_at"] = now_iso()
+                await db.online_order_items.insert_one(item_doc)
+            committed["items_upserted"] += 1
+            canon["_committed"] = {
+                "movements_posted":  posted,
+                "implicit_reserves": implicit,
+                "online_order_id":   online_order_pk,
+            }
+
+        if exceptions:
+            await db.online_order_exceptions.insert_many(exceptions)
+            committed["exceptions_queued"] = len(exceptions)
+
+        await log_activity(
+            "DISPATCH_IMPORT", "online_orders",
+            f"{platform_lc}: {committed['movements_posted']} units dispatched, "
+            f"{committed['implicit_reserves']} implicit reserves, "
+            f"{committed['already_dispatched']} already-dispatched skipped, "
+            f"{committed['exceptions_queued']} exceptions "
+            f"(batch {import_batch_id})",
+            u["email"],
+        )
+
+    return {
+        "platform":           platform_lc,
+        "role":               "dispatch",
+        "filename":           filename,
+        "header_row_1_based": header_row_1,
+        "header":             header,
+        "dry_run":            dry_run,
+        "stats":              stats,
+        "committed":          committed if not dry_run else None,
+        "import_batch_id":    import_batch_id,
+        "rows":               canonical_rows,
+    }
+
+
+
 # ---------- COSTING (live preview) ----------
 @api.post("/costing/preview")
 async def costing_preview(payload: StyleIn, request: Request):

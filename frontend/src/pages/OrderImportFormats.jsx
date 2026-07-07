@@ -42,16 +42,30 @@ const FALLBACK_ORDER_FIELDS = [
   "bin_barcode",
 ];
 
+// Fallback if _meta call fails — matches DISPATCH_CANONICAL_FIELDS in server.py
+const FALLBACK_DISPATCH_FIELDS = [
+  "order_id", "order_release_id",
+  "leaf_sku", "channel_sku",
+  "packed_on", "status",
+  "mrp", "selling_value",
+  "cgst", "sgst", "igst",
+  "tracking_id",
+  "destination_city", "destination_state", "destination_pincode",
+  "store_packet_id",
+  "product_title", "qty",
+];
+
 const FIELD_HELP = {
+  // Order/picklist fields
   order_id:         "Marketplace order id. Leave blank for pure-picklist files (Myntra OP-xxxxx.csv).",
   order_item_id:    "Per-line order-item id. May carry a leading apostrophe (Excel text-safety) — stripped automatically.",
   shipment_id:      "Marketplace shipment id (Flipkart).",
   order_date:       "When the order was placed.",
   dispatch_by_date: "Marketplace-imposed dispatch SLA.",
-  leaf_sku:         "REQUIRED. Our own catalogue SKU column (Flipkart: 'SKU', Myntra: 'sellerSkuCode'). Prefix stripping + split_leaf_sku() normalise variants.",
+  leaf_sku:         "REQUIRED. Our own catalogue SKU column (Flipkart: 'SKU', Myntra: 'sellerSkuCode'/'Seller_sku_code'). Prefix stripping + split_leaf_sku() normalise variants.",
   myntra_sku_code:  "Myntra's own SKU code (myntraSkuCode).",
   product_title:    "Product title / description.",
-  qty:              "REQUIRED. Units per row (Myntra picklist can be >1 per line).",
+  qty:              "Units per row. For order/picklist files can be >1. For dispatch files defaults to 1 per row (each row = 1 unit packed).",
   selling_price:    "Per-unit selling price.",
   invoice_amount:   "Line-level invoice amount.",
   order_state:      "Marketplace order state.",
@@ -61,10 +75,25 @@ const FIELD_HELP = {
   state:            "Buyer state.",
   pincode:          "Buyer PIN code.",
   bin_barcode:      "Warehouse bin barcode (Myntra picklist).",
+  // Dispatch-specific fields
+  order_release_id:    "Marketplace's per-shipment release id (join key across Myntra's Packed / Monthly / Settlement files).",
+  channel_sku:         "Platform's own SKU code (Myntra SKU code, Flipkart FSN).",
+  packed_on:           "Date the unit was packed by the warehouse.",
+  status:              "Status column in the dispatch file (typically 'PACKED').",
+  mrp:                 "Maximum Retail Price per unit.",
+  selling_value:       "Actual selling value (net of discount) per unit.",
+  cgst:                "Central GST amount.",
+  sgst:                "State GST amount.",
+  igst:                "Integrated GST amount.",
+  destination_city:    "Delivery city.",
+  destination_state:   "Delivery state.",
+  destination_pincode: "Delivery PIN code.",
+  store_packet_id:     "Warehouse packet id (Myntra).",
 };
 
 const emptyConfig = {
   platform: "nykaa",
+  role: "order",
   sheet_locator:  { type: "first_sheet" },
   header_locator: { type: "fixed_row", row: 0 },
   skip_rows_after_header: 0,
@@ -306,23 +335,35 @@ function PrefixReplacementEditor({ value, onChange }) {
 export default function OrderImportFormats() {
   const [configs, setConfigs] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [canonicalFields, setCanonicalFields] = useState(FALLBACK_ORDER_FIELDS);
+  const [canonicalOrder, setCanonicalOrder] = useState(FALLBACK_ORDER_FIELDS);
+  const [canonicalDispatch, setCanonicalDispatch] = useState(FALLBACK_DISPATCH_FIELDS);
+  const [roleFilter, setRoleFilter] = useState("all"); // "all" | "order" | "dispatch"
   const [open, setOpen] = useState(false);
-  const [editingPlatform, setEditingPlatform] = useState(null);
+  const [editingKey, setEditingKey] = useState(null); // {platform, role} when editing
   const [form, setForm] = useState(emptyConfig);
   const [formError, setFormError] = useState("");
   const [saving, setSaving] = useState(false);
 
+  // Canonical field list for the currently-editing form (swaps by role)
+  const canonicalFields = useMemo(
+    () => (form.role === "dispatch" ? canonicalDispatch : canonicalOrder),
+    [form.role, canonicalOrder, canonicalDispatch]
+  );
+
   const load = async () => {
     setLoading(true);
     try {
-      const [listRes, metaRes] = await Promise.all([
+      const [listRes, metaOrderRes, metaDispatchRes] = await Promise.all([
         http.get("/order-import-format-configs"),
-        http.get("/order-import-format-configs/_meta/canonical-fields"),
+        http.get("/order-import-format-configs/_meta/canonical-fields?role=order"),
+        http.get("/order-import-format-configs/_meta/canonical-fields?role=dispatch"),
       ]);
       setConfigs(listRes.data);
-      if (metaRes.data?.canonical_fields?.length) {
-        setCanonicalFields(metaRes.data.canonical_fields);
+      if (metaOrderRes.data?.canonical_fields?.length) {
+        setCanonicalOrder(metaOrderRes.data.canonical_fields);
+      }
+      if (metaDispatchRes.data?.canonical_fields?.length) {
+        setCanonicalDispatch(metaDispatchRes.data.canonical_fields);
       }
     } catch (e) {
       console.error(e);
@@ -333,30 +374,43 @@ export default function OrderImportFormats() {
 
   useEffect(() => { load(); }, []);
 
-  const startCreate = () => {
-    setEditingPlatform(null);
+  const filteredConfigs = useMemo(
+    () => (roleFilter === "all"
+      ? configs
+      : configs.filter((c) => (c.role || "order") === roleFilter)),
+    [configs, roleFilter]
+  );
+
+  const startCreate = (roleDefault = "order") => {
+    setEditingKey(null);
+    const fields = roleDefault === "dispatch" ? canonicalDispatch : canonicalOrder;
     setForm({
       ...emptyConfig,
-      column_map: canonicalFields.reduce((acc, f) => ({ ...acc, [f]: "" }), {}),
+      role: roleDefault,
+      is_picklist: false,
+      column_map: fields.reduce((acc, f) => ({ ...acc, [f]: "" }), {}),
     });
     setFormError("");
     setOpen(true);
   };
 
   const startEdit = (cfg) => {
-    setEditingPlatform(cfg.platform);
+    const cfgRole = cfg.role || "order";
+    setEditingKey({ platform: cfg.platform, role: cfgRole });
+    const fields = cfgRole === "dispatch" ? canonicalDispatch : canonicalOrder;
     const cm = { ...(cfg.column_map || {}) };
-    canonicalFields.forEach((f) => {
+    fields.forEach((f) => {
       if (!(f in cm)) cm[f] = "";
       if (cm[f] === null) cm[f] = "";
     });
     setForm({
       platform: cfg.platform,
+      role: cfgRole,
       sheet_locator:  cfg.sheet_locator  || { type: "first_sheet" },
       header_locator: cfg.header_locator || { type: "fixed_row", row: 0 },
       skip_rows_after_header: cfg.skip_rows_after_header ?? 0,
       column_map: cm,
-      known_sku_prefixes_to_strip: cfg.known_sku_prefixes_to_strip || [],
+      known_sku_prefixes_to_strip:   cfg.known_sku_prefixes_to_strip   || [],
       known_sku_prefix_replacements: cfg.known_sku_prefix_replacements || {},
       is_picklist: !!cfg.is_picklist,
       active: cfg.active !== false,
@@ -374,7 +428,7 @@ export default function OrderImportFormats() {
       cmClean[k] = val === "" ? null : val;
     });
     if (!cmClean.leaf_sku) {
-      setFormError("column_map.leaf_sku is required — every order/picklist file must expose our internal SKU column.");
+      setFormError("column_map.leaf_sku is required — every order/picklist/dispatch file must expose our internal SKU column.");
       return;
     }
     if (form.sheet_locator?.type === "fixed_name" && !form.sheet_locator?.name?.trim()) {
@@ -396,7 +450,7 @@ export default function OrderImportFormats() {
       header_locator: form.header_locator,
       skip_rows_after_header: Number(form.skip_rows_after_header || 0),
       column_map: cmClean,
-      known_sku_prefixes_to_strip: form.known_sku_prefixes_to_strip || [],
+      known_sku_prefixes_to_strip:   form.known_sku_prefixes_to_strip   || [],
       known_sku_prefix_replacements: form.known_sku_prefix_replacements || {},
       is_picklist: !!form.is_picklist,
       active: !!form.active,
@@ -404,11 +458,15 @@ export default function OrderImportFormats() {
     };
     setSaving(true);
     try {
-      if (editingPlatform) {
-        await http.put(`/order-import-format-configs/${editingPlatform}`, body);
+      if (editingKey) {
+        await http.put(
+          `/order-import-format-configs/${editingKey.platform}?role=${editingKey.role}`,
+          body,
+        );
       } else {
         await http.post("/order-import-format-configs", {
           platform: form.platform,
+          role: form.role,
           ...body,
         });
       }
@@ -426,41 +484,74 @@ export default function OrderImportFormats() {
   return (
     <div className="p-6 space-y-6">
       <PageHeader
-        title="Order Import Formats"
-        subtitle="Config-driven registry of platform ORDER / PICKLIST file formats. Add a new marketplace's order-export or picklist-export format without touching parser code."
+        title="Order & Dispatch Import Formats"
+        subtitle="Config-driven registry of platform ORDER / PICKLIST / DISPATCH file formats. Add a new marketplace's file format without touching parser code."
         action={
-          <BtnPrimary onClick={startCreate} data-testid="oif-add">
-            <Plus className="w-4 h-4 mr-1.5" /> Add platform
-          </BtnPrimary>
+          <div className="flex gap-2">
+            <BtnSecondary onClick={() => startCreate("dispatch")} data-testid="oif-add-dispatch">
+              <Plus className="w-4 h-4 mr-1.5" /> Add dispatch config
+            </BtnSecondary>
+            <BtnPrimary onClick={() => startCreate("order")} data-testid="oif-add">
+              <Plus className="w-4 h-4 mr-1.5" /> Add order config
+            </BtnPrimary>
+          </div>
         }
       />
+
+      {/* Role filter tabs */}
+      <div className="flex gap-1 border-b border-neutral-200">
+        {[
+          { key: "all",      label: "All",       count: configs.length },
+          { key: "order",    label: "Order / Picklist", count: configs.filter((c) => (c.role || "order") === "order").length },
+          { key: "dispatch", label: "Dispatch",  count: configs.filter((c) => c.role === "dispatch").length },
+        ].map((tab) => (
+          <button key={tab.key}
+            onClick={() => setRoleFilter(tab.key)}
+            className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+              roleFilter === tab.key
+                ? "border-neutral-900 text-neutral-900"
+                : "border-transparent text-neutral-500 hover:text-neutral-800"
+            }`}
+            data-testid={`oif-role-tab-${tab.key}`}>
+            {tab.label}
+            <span className="ml-1.5 text-[10px] bg-neutral-100 px-1.5 py-0.5 rounded font-mono">
+              {tab.count}
+            </span>
+          </button>
+        ))}
+      </div>
 
       <Card>
         <div className="p-4 flex items-start gap-3 bg-amber-50/40 border-b border-neutral-200 text-xs text-neutral-700 leading-snug">
           <Info className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
           <div>
-            Each config maps canonical order fields (<span className="font-mono">order_id</span>,{" "}
+            Each config maps canonical fields (<span className="font-mono">order_id</span>,{" "}
             <span className="font-mono">leaf_sku</span>, <span className="font-mono">qty</span>,{" "}
-            <span className="font-mono">shipment_id</span>, <span className="font-mono">dispatch_by_date</span>, …) to the actual column
+            <span className="font-mono">packed_on</span>, <span className="font-mono">dispatch_by_date</span>, …) to the actual column
             names in that platform's file. <span className="font-semibold">leaf_sku</span> is required.
+            A platform can have BOTH an <span className="font-semibold text-blue-700">order</span> (or picklist) config AND a{" "}
+            <span className="font-semibold text-emerald-700">dispatch</span> config (Myntra ships both).
             Mark <span className="font-semibold">is_picklist</span> for files with no order_id
             (e.g. Myntra <span className="font-mono">OP-xxxxx.csv</span>) — the filename stem becomes the
             <span className="font-mono"> picklist_batch_id</span>. Use{" "}
-            <span className="font-semibold">known_sku_prefixes_to_strip</span> to strip platform prefixes
-            (Flipkart "TH", Myntra "FLL", …) before SKU resolution.
+            <span className="font-semibold">known_sku_prefixes_to_strip</span> for platform prefixes (Flipkart "TH")
+            and <span className="font-semibold text-purple-700">known_sku_prefix_replacements</span> for typo variants (Myntra "FLL" → "FL").
           </div>
         </div>
 
         {loading ? (
           <div className="p-6 text-sm text-neutral-500 italic">Loading order-import configs…</div>
-        ) : configs.length === 0 ? (
-          <div className="p-6 text-sm text-neutral-500 italic">No order-import configs yet.</div>
+        ) : filteredConfigs.length === 0 ? (
+          <div className="p-6 text-sm text-neutral-500 italic">
+            {configs.length === 0 ? "No configs yet." : `No configs in the '${roleFilter}' filter.`}
+          </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-neutral-50 text-[10px] uppercase tracking-wider text-neutral-600">
                 <tr>
                   <th className="text-left p-3 border-b">Platform</th>
+                  <th className="text-left p-3 border-b">Role</th>
                   <th className="text-left p-3 border-b">Sheet locator</th>
                   <th className="text-left p-3 border-b">Header locator</th>
                   <th className="text-left p-3 border-b">Leaf SKU column</th>
@@ -472,10 +563,10 @@ export default function OrderImportFormats() {
                 </tr>
               </thead>
               <tbody>
-                {configs.map((c) => (
-                  <tr key={c.platform}
+                {filteredConfigs.map((c) => (
+                  <tr key={`${c.platform}-${c.role || 'order'}`}
                     className="border-b border-neutral-100 hover:bg-neutral-50"
-                    data-testid={`oif-row-${c.platform}`}>
+                    data-testid={`oif-row-${c.platform}-${c.role || 'order'}`}>
                     <td className="p-3 font-semibold capitalize">
                       <span className="inline-flex items-center gap-1.5">
                         <FileSpreadsheet className="w-3.5 h-3.5 text-neutral-500" />
@@ -486,6 +577,13 @@ export default function OrderImportFormats() {
                           </span>
                         )}
                       </span>
+                    </td>
+                    <td className="p-3">
+                      {(c.role || "order") === "dispatch" ? (
+                        <Badge color="green">dispatch</Badge>
+                      ) : (
+                        <Badge color="slate">order</Badge>
+                      )}
                     </td>
                     <td className="p-3 text-xs">
                       <span className="font-mono text-neutral-700">
@@ -540,7 +638,7 @@ export default function OrderImportFormats() {
                     <td className="p-3 text-right">
                       <button onClick={() => startEdit(c)}
                         className="text-xs text-neutral-700 hover:text-neutral-900 inline-flex items-center gap-1"
-                        data-testid={`oif-edit-${c.platform}`}>
+                        data-testid={`oif-edit-${c.platform}-${c.role || 'order'}`}>
                         <Pencil className="w-3.5 h-3.5" /> Edit
                       </button>
                     </td>
@@ -555,12 +653,14 @@ export default function OrderImportFormats() {
       {open && (
         <Drawer
           onClose={() => setOpen(false)}
-          title={editingPlatform ? `Edit ${editingPlatform} order-import format` : "Add order-import format"}
+          title={editingKey
+            ? `Edit ${editingKey.platform} · ${editingKey.role} config`
+            : `Add ${form.role} config`}
           width="max-w-4xl"
         >
           <div className="space-y-5">
-            <div className="grid grid-cols-2 gap-3">
-              {editingPlatform ? (
+            <div className="grid grid-cols-3 gap-3">
+              {editingKey ? (
                 <div>
                   <label className="block text-xs font-semibold uppercase tracking-wider text-neutral-500 mb-1">Platform</label>
                   <div className="h-10 px-3 flex items-center gap-2 rounded-md border border-neutral-200 bg-neutral-50 font-mono text-sm capitalize">
@@ -580,13 +680,44 @@ export default function OrderImportFormats() {
                 </Select>
               )}
 
+              {editingKey ? (
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-neutral-500 mb-1">Role</label>
+                  <div className="h-10 px-3 flex items-center gap-2 rounded-md border border-neutral-200 bg-neutral-50 font-mono text-sm">
+                    {form.role}
+                    <span className="ml-auto text-[10px] uppercase tracking-wider text-neutral-500 bg-white border border-neutral-200 rounded px-1.5 py-0.5">
+                      immutable
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <Select label="Role" value={form.role}
+                  onChange={(e) => {
+                    const newRole = e.target.value;
+                    const fields = newRole === "dispatch" ? canonicalDispatch : canonicalOrder;
+                    setForm({
+                      ...form,
+                      role: newRole,
+                      // reset column_map when role changes (different fields)
+                      column_map: fields.reduce((acc, f) => ({ ...acc, [f]: "" }), {}),
+                      is_picklist: newRole === "dispatch" ? false : form.is_picklist,
+                    });
+                  }}
+                  testId="oif-form-role">
+                  <option value="order">Order / Picklist</option>
+                  <option value="dispatch">Dispatch (daily "what got packed")</option>
+                </Select>
+              )}
+
               <div className="flex items-center gap-6 pt-6">
-                <label className="inline-flex items-center gap-2 text-sm">
-                  <input type="checkbox" checked={!!form.is_picklist}
-                    onChange={(e) => setForm({ ...form, is_picklist: e.target.checked })}
-                    data-testid="oif-form-picklist" />
-                  <span>Picklist file (no order_id — derive picklist_batch_id from filename)</span>
-                </label>
+                {form.role === "order" && (
+                  <label className="inline-flex items-center gap-2 text-sm">
+                    <input type="checkbox" checked={!!form.is_picklist}
+                      onChange={(e) => setForm({ ...form, is_picklist: e.target.checked })}
+                      data-testid="oif-form-picklist" />
+                    <span>Picklist file</span>
+                  </label>
+                )}
                 <label className="inline-flex items-center gap-2 text-sm">
                   <input type="checkbox" checked={!!form.active}
                     onChange={(e) => setForm({ ...form, active: e.target.checked })}

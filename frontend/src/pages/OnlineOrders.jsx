@@ -7,7 +7,7 @@ import {
 import { Drawer } from "./Materials";
 import {
   Upload, ShoppingBag, RefreshCw, FileWarning, Settings2,
-  ChevronLeft, PlayCircle, CheckCircle2, AlertTriangle,
+  ChevronLeft, PlayCircle, CheckCircle2, AlertTriangle, Truck,
 } from "lucide-react";
 import { Link } from "react-router-dom";
 
@@ -450,11 +450,375 @@ function PreviewPanel({ preview, error, committing, onBack, onCommit }) {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Dispatch Import Drawer — daily "what got packed today" (Phase H)
+//
+// Different from ImportDrawer because:
+//   - Uses /online-orders/dispatch-import (role="dispatch" configs)
+//   - Preview surfaces packed_on / order_release_id / tracking / destination
+//   - Commit posts fg_stock_movements — with implicit-reserve fallback for
+//     first-time dispatches (Myntra's file is often the FIRST record)
+//   - Rows are always 1 unit per row (unlike picklist which can be qty>1)
+// ═══════════════════════════════════════════════════════════════════════
+function DispatchImportDrawer({ onClose, onDone }) {
+  const [configs, setConfigs]     = useState(null);
+  const [platform, setPlatform]   = useState("");
+  const [file, setFile]           = useState(null);
+  const [step, setStep]           = useState("choose");
+  const [preview, setPreview]     = useState(null);
+  const [committing, setCommitting] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+  const [committed, setCommitted] = useState(null);
+  const [error, setError]         = useState("");
+  const fileRef = useRef();
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await http.get("/order-import-format-configs?role=dispatch&active=true");
+        setConfigs(r.data || []);
+        if (r.data?.length) setPlatform(r.data[0].platform);
+      } catch (e) {
+        setConfigs([]);
+      }
+    })();
+  }, []);
+
+  const selectedCfg = useMemo(
+    () => (configs || []).find((c) => c.platform === platform) || null,
+    [configs, platform]
+  );
+
+  async function runPreview() {
+    setError("");
+    if (!file) return setError("Please select a file.");
+    if (!platform) return setError("Please choose a platform.");
+    setPreviewing(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const r = await http.post(
+        `/online-orders/dispatch-import?platform=${encodeURIComponent(platform)}&dry_run=true`,
+        fd,
+        { headers: { "Content-Type": "multipart/form-data" } }
+      );
+      setPreview(r.data);
+      setStep("preview");
+    } catch (e) {
+      const raw = e.response?.data?.detail;
+      setError(typeof raw === "string" ? raw : (raw?.[0]?.msg || e.message || "Preview failed."));
+    } finally {
+      setPreviewing(false);
+    }
+  }
+
+  async function runCommit() {
+    setError("");
+    setCommitting(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const r = await http.post(
+        `/online-orders/dispatch-import?platform=${encodeURIComponent(platform)}&dry_run=false`,
+        fd,
+        { headers: { "Content-Type": "multipart/form-data" } }
+      );
+      setCommitted(r.data);
+      setStep("done");
+      onDone();
+    } catch (e) {
+      const raw = e.response?.data?.detail;
+      setError(typeof raw === "string" ? raw : (raw?.[0]?.msg || e.message || "Commit failed."));
+    } finally {
+      setCommitting(false);
+    }
+  }
+
+  function reset() {
+    setPreview(null); setCommitted(null); setStep("choose"); setError("");
+  }
+
+  const noConfigs = configs !== null && configs.length === 0;
+
+  return (
+    <Drawer
+      onClose={onClose}
+      title={
+        step === "choose"  ? "Import daily dispatch — step 1: choose file" :
+        step === "preview" ? "Import daily dispatch — step 2: review & commit" :
+                             "Dispatch import — done"
+      }
+      width="max-w-5xl"
+    >
+      <div className="space-y-5">
+        {noConfigs && step === "choose" && (
+          <div className="bg-amber-50 border-2 border-amber-300 px-4 py-4 text-sm text-amber-900">
+            <div className="font-bold mb-1 flex items-center gap-2">
+              <FileWarning className="w-4 h-4" /> No dispatch-import formats configured yet.
+            </div>
+            <div className="text-xs mb-3">
+              Each platform's daily "what got packed" file format lives as a config row with role="dispatch".
+            </div>
+            <Link to="/order-import-formats" onClick={onClose}>
+              <BtnPrimary>
+                <span className="flex items-center gap-2">
+                  <Settings2 className="w-4 h-4" /> Configure a dispatch format
+                </span>
+              </BtnPrimary>
+            </Link>
+          </div>
+        )}
+
+        {step === "choose" && configs && configs.length > 0 && (
+          <>
+            <div className="bg-emerald-50 border-2 border-emerald-200 px-4 py-3 text-sm text-emerald-900">
+              <div className="font-bold mb-1 flex items-center gap-2">
+                <Truck className="w-4 h-4" /> Daily dispatch import (config-driven)
+              </div>
+              <div className="text-xs">
+                Each row = 1 unit dispatched. On commit, posts a <span className="font-mono">dispatched</span> fg_stock_movement
+                per unit → decrements <span className="font-mono">ready_stock_qty</span> and releases any matching reservation.
+                If no reservation exists (first-time dispatch), an implicit <span className="font-mono">reserved</span> is
+                posted first so the ledger stays honest. Rows that can't resolve or that would push inventory below zero
+                go to the exception queue.
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <Select label="Platform *" id="dispatch-platform" value={platform}
+                onChange={(e) => setPlatform(e.target.value)}>
+                {configs.map((c) => (
+                  <option key={c.platform} value={c.platform}>
+                    {c.platform.charAt(0).toUpperCase() + c.platform.slice(1)}
+                  </option>
+                ))}
+              </Select>
+
+              {selectedCfg && (
+                <div className="pt-6 text-xs space-y-1">
+                  <div>
+                    <Badge color="green">dispatch</Badge>{" "}
+                    <span className="ml-1 text-neutral-500">config for {selectedCfg.platform}</span>
+                  </div>
+                  <div className="font-mono text-[11px] text-neutral-600">
+                    leaf_sku column: {selectedCfg.column_map?.leaf_sku || "—"} · packed_on: {selectedCfg.column_map?.packed_on || "—"}
+                  </div>
+                  {Object.keys(selectedCfg.known_sku_prefix_replacements || {}).length > 0 && (
+                    <div className="font-mono text-[11px] text-purple-700">
+                      replaces: {Object.entries(selectedCfg.known_sku_prefix_replacements || {}).map(([k, v]) => `${k}→${v}`).join(", ")}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-1">
+              <div className="text-[10px] uppercase tracking-wider font-bold text-slate-600">File *</div>
+              <div
+                className="border-2 border-dashed border-slate-300 hover:border-slate-500 px-4 py-6 text-center cursor-pointer transition-colors"
+                onClick={() => fileRef.current?.click()}
+                data-testid="dispatch-import-file-drop"
+              >
+                <Upload className="w-6 h-6 text-slate-400 mx-auto mb-2" />
+                {file
+                  ? <div className="text-sm font-mono font-bold text-slate-700">{file.name}</div>
+                  : <div className="text-sm text-slate-500">Click to choose the daily dispatch .csv / .xlsx</div>}
+              </div>
+              <input ref={fileRef} type="file"
+                accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                className="hidden"
+                onChange={(e) => setFile(e.target.files[0] || null)} />
+            </div>
+
+            {error && (
+              <div className="bg-red-50 border-2 border-red-300 px-4 py-3 text-sm text-red-700 font-semibold whitespace-pre-line">
+                {error}
+              </div>
+            )}
+
+            <div className="flex gap-3 pt-2">
+              <BtnPrimary id="btn-dispatch-preview" onClick={runPreview}
+                disabled={previewing || !file} className="flex-1">
+                <span className="flex items-center justify-center gap-2">
+                  <PlayCircle className="w-4 h-4" />
+                  {previewing ? "Parsing preview…" : "Preview dispatch"}
+                </span>
+              </BtnPrimary>
+              <BtnSecondary onClick={onClose} disabled={previewing}>Cancel</BtnSecondary>
+            </div>
+          </>
+        )}
+
+        {step === "preview" && preview && (
+          <DispatchPreviewPanel
+            preview={preview}
+            error={error}
+            committing={committing}
+            onBack={() => { setStep("choose"); setPreview(null); }}
+            onCommit={runCommit}
+          />
+        )}
+
+        {step === "done" && committed && (
+          <div className="space-y-3">
+            <div className="bg-emerald-50 border-2 border-emerald-300 px-4 py-4 text-sm text-emerald-900">
+              <div className="font-bold flex items-center gap-2 text-base mb-1">
+                <CheckCircle2 className="w-5 h-5" /> Dispatch committed
+              </div>
+              <div className="text-xs font-mono mb-1">batch: {committed.import_batch_id}</div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
+                <MiniStat label="units dispatched" value={committed.committed?.movements_posted ?? 0} accent="#059669" />
+                <MiniStat label="implicit reserves" value={committed.committed?.implicit_reserves ?? 0} accent="#D97706" />
+                <MiniStat label="orders upserted" value={committed.committed?.orders_upserted ?? 0} accent="#0F172A" />
+                <MiniStat label="items upserted" value={committed.committed?.items_upserted ?? 0} accent="#C27842" />
+                <MiniStat label="already-dispatched" value={committed.committed?.already_dispatched ?? 0} accent="#64748B" />
+                <MiniStat label="exceptions" value={committed.committed?.exceptions_queued ?? 0} accent="#DC2626" />
+              </div>
+            </div>
+            <div className="flex gap-3">
+              <BtnSecondary onClick={reset}>
+                <ChevronLeft className="w-4 h-4 mr-1.5" /> Import another
+              </BtnSecondary>
+              <BtnPrimary onClick={onClose} className="flex-1">Close</BtnPrimary>
+            </div>
+          </div>
+        )}
+      </div>
+    </Drawer>
+  );
+}
+
+function DispatchPreviewPanel({ preview, error, committing, onBack, onCommit }) {
+  const rows = preview.rows || [];
+  const stats = preview.stats || {};
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-slate-50 border-2 border-slate-200 px-4 py-3 text-xs text-slate-800 font-mono space-y-1">
+        <div>platform: <span className="font-bold">{preview.platform}</span> · role: <span className="font-bold">dispatch</span></div>
+        <div>file: {preview.filename}</div>
+        <div>header row (1-based): {preview.header_row_1_based}</div>
+      </div>
+
+      <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+        <MiniStat label="total rows"        value={stats.total_rows_read         ?? 0} accent="#0F172A" />
+        <MiniStat label="matched"           value={stats.matched                 ?? 0} accent="#16A34A" />
+        <MiniStat label="unmatched"         value={stats.unmatched               ?? 0} accent="#DC2626" />
+        <MiniStat label="empty leaf_sku"    value={stats.empty_leaf_sku          ?? 0} accent="#D97706" />
+        <MiniStat label="distinct releases" value={stats.distinct_order_releases ?? 0} accent="#2563EB" />
+      </div>
+
+      <div className="border-2 border-slate-200 rounded overflow-hidden">
+        <div className="max-h-[420px] overflow-y-auto overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-100 sticky top-0 text-[10px] uppercase tracking-wider text-slate-600">
+              <tr>
+                <th className="text-left p-2 border-b">Row #</th>
+                <th className="text-left p-2 border-b">Order / Release</th>
+                <th className="text-left p-2 border-b">Raw leaf_sku</th>
+                <th className="text-left p-2 border-b">Group → Size</th>
+                <th className="text-left p-2 border-b">Style code</th>
+                <th className="text-left p-2 border-b">Packed on</th>
+                <th className="text-left p-2 border-b">Tracking</th>
+                <th className="text-left p-2 border-b">Destination</th>
+                <th className="text-right p-2 border-b">Qty</th>
+                <th className="text-left p-2 border-b">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.slice(0, 300).map((r, i) => {
+                const matched = !!r.matched;
+                return (
+                  <tr key={i} className={`border-b border-neutral-100 ${!matched ? "bg-red-50/40" : "hover:bg-slate-50"}`}>
+                    <td className="p-2 font-mono">{r.source_row_index}</td>
+                    <td className="p-2 font-mono text-[11px]">
+                      <div>{r.order_id || "—"}</div>
+                      <div className="text-emerald-700">{r.order_release_id || "—"}</div>
+                    </td>
+                    <td className="p-2 font-mono">
+                      {r.leaf_sku_raw || "—"}
+                      {r.leaf_sku_replaced_prefix && (
+                        <span className="ml-1 text-[9px] text-purple-800 bg-purple-100 border border-purple-300 rounded px-1">
+                          {r.leaf_sku_replaced_prefix}→fix
+                        </span>
+                      )}
+                      {r.leaf_sku_stripped_prefix && (
+                        <span className="ml-1 text-[9px] text-amber-700 bg-amber-100 border border-amber-300 rounded px-1">
+                          -{r.leaf_sku_stripped_prefix}
+                        </span>
+                      )}
+                    </td>
+                    <td className="p-2 font-mono text-[11px]">
+                      {r.group_id || "—"}{" → "}{r.derived_size || r.size || "—"}
+                    </td>
+                    <td className="p-2 font-mono">{r.style_code || "—"}</td>
+                    <td className="p-2 text-[11px] whitespace-nowrap">{r.packed_on || "—"}</td>
+                    <td className="p-2 font-mono text-[11px]">{r.tracking_id || "—"}</td>
+                    <td className="p-2 text-[11px]">
+                      {r.destination_city || "—"}{r.destination_state ? `, ${r.destination_state}` : ""}
+                    </td>
+                    <td className="p-2 font-mono text-right">{r.qty}</td>
+                    <td className="p-2">
+                      {matched ? (
+                        <Badge color="green">{r.match_via || "matched"}</Badge>
+                      ) : (
+                        <div className="text-red-700 text-[10px] leading-tight">
+                          <Badge color="red">exception</Badge>
+                          <div className="mt-1 max-w-[220px]">{r.exception_reason}</div>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {rows.length > 300 && (
+                <tr>
+                  <td colSpan={10} className="p-3 text-center text-xs text-slate-500 italic">
+                    Showing first 300 of {rows.length} rows. All rows will be committed.
+                  </td>
+                </tr>
+              )}
+              {rows.length === 0 && (
+                <tr>
+                  <td colSpan={10} className="p-6 text-center text-sm text-slate-400 italic">
+                    No rows parsed — check header row + column map.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {error && (
+        <div className="bg-red-50 border-2 border-red-300 px-4 py-3 text-sm text-red-700 font-semibold whitespace-pre-line">
+          {error}
+        </div>
+      )}
+
+      <div className="flex gap-3 pt-2 border-t border-slate-200">
+        <BtnSecondary onClick={onBack} disabled={committing}>
+          <ChevronLeft className="w-4 h-4 mr-1.5" /> Back
+        </BtnSecondary>
+        <BtnPrimary onClick={onCommit} disabled={committing || rows.length === 0 || stats.matched === 0} className="flex-1">
+          <span className="flex items-center justify-center gap-2">
+            <Truck className="w-4 h-4" />
+            {committing ? "Committing…" :
+             `Commit dispatch — decrement ready_stock for ${stats.matched} matched row${stats.matched !== 1 ? "s" : ""}`}
+          </span>
+        </BtnPrimary>
+      </div>
+    </div>
+  );
+}
+
+
 // ── Main page ─────────────────────────────────────────────
 export default function OnlineOrders() {
   const [jobs, setJobs]         = useState([]);
   const [loading, setLoading]   = useState(true);
   const [importOpen, setImportOpen] = useState(false);
+  const [dispatchOpen, setDispatchOpen] = useState(false);
 
   const [filterChannel, setFilterChannel]   = useState("");
   const [filterStatus, setFilterStatus]     = useState("");
@@ -521,6 +885,9 @@ export default function OnlineOrders() {
             </Link>
             <BtnSecondary id="btn-refresh-orders" onClick={load}>
               <span className="flex items-center gap-1.5"><RefreshCw className="w-4 h-4" /> Refresh</span>
+            </BtnSecondary>
+            <BtnSecondary id="btn-dispatch-import" onClick={() => setDispatchOpen(true)}>
+              <span className="flex items-center gap-2"><Truck className="w-4 h-4" /> Import dispatch</span>
             </BtnSecondary>
             <BtnPrimary id="btn-import-orders" onClick={() => setImportOpen(true)}>
               <span className="flex items-center gap-2"><Upload className="w-4 h-4" /> Import orders</span>
@@ -639,6 +1006,10 @@ export default function OnlineOrders() {
 
       {importOpen && (
         <ImportDrawer onClose={() => setImportOpen(false)} onDone={load} />
+      )}
+
+      {dispatchOpen && (
+        <DispatchImportDrawer onClose={() => setDispatchOpen(false)} onDone={load} />
       )}
     </div>
   );
