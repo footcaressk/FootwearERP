@@ -9,7 +9,7 @@ import sys
 from typing import Dict, Any, List
 
 # Base URL from frontend/.env
-BASE_URL = "https://8084e150-a3b8-4ec1-9c91-cd7e92a259f1.preview.emergentagent.com/api"
+BASE_URL = "https://footwear-hub-565.preview.emergentagent.com/api"
 
 # Test credentials from /app/memory/test_credentials.md
 ADMIN_EMAIL = "admin@example.com"

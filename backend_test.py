@@ -21,7 +21,7 @@ import sys
 import io
 
 # Backend URL from frontend/.env
-BASE_URL = "https://run-here.preview.emergentagent.com/api"
+BASE_URL = "https://footwear-hub-565.preview.emergentagent.com/api"
 
 # Test credentials from /app/memory/test_credentials.md
 ADMIN_EMAIL = "admin@example.com"

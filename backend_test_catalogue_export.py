@@ -23,7 +23,7 @@ import requests
 from io import BytesIO
 
 # Base URL from environment
-BASE_URL = os.getenv("REACT_APP_BACKEND_URL", "https://run-here.preview.emergentagent.com")
+BASE_URL = os.getenv("REACT_APP_BACKEND_URL", "https://footwear-hub-565.preview.emergentagent.com")
 API_BASE = f"{BASE_URL}/api"
 
 # Test credentials
