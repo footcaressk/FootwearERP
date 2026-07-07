@@ -202,6 +202,11 @@ function ImportDrawer({ onClose, onDone }) {
                       strips prefixes: {(selectedCfg.known_sku_prefixes_to_strip || []).join(", ")}
                     </div>
                   )}
+                  {Object.keys(selectedCfg.known_sku_prefix_replacements || {}).length > 0 && (
+                    <div className="font-mono text-[11px] text-purple-700">
+                      replaces: {Object.entries(selectedCfg.known_sku_prefix_replacements || {}).map(([k, v]) => `${k}→${v}`).join(", ")}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -373,6 +378,11 @@ function PreviewPanel({ preview, error, committing, onBack, onCommit }) {
                     </td>
                     <td className="p-2 font-mono">
                       {r.leaf_sku_raw || "—"}
+                      {r.leaf_sku_replaced_prefix && (
+                        <span className="ml-1 text-[9px] text-purple-800 bg-purple-100 border border-purple-300 rounded px-1">
+                          {r.leaf_sku_replaced_prefix}→fix
+                        </span>
+                      )}
                       {r.leaf_sku_stripped_prefix && (
                         <span className="ml-1 text-[9px] text-amber-700 bg-amber-100 border border-amber-300 rounded px-1">
                           -{r.leaf_sku_stripped_prefix}

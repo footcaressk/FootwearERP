@@ -70,6 +70,7 @@ const emptyConfig = {
   skip_rows_after_header: 0,
   column_map: {},
   known_sku_prefixes_to_strip: [],
+  known_sku_prefix_replacements: {},
   is_picklist: false,
   active: true,
   notes: "",
@@ -209,7 +210,7 @@ function PrefixListEditor({ value, onChange }) {
       <div className="flex flex-wrap gap-1.5">
         {chips.length === 0 && (
           <span className="text-xs text-neutral-400 italic">
-            None configured. Add prefixes like "TH", "FLL" so leaf_sku matching works despite platform prefixes.
+            None configured. Add prefixes like "TH" so leaf_sku matching works despite platform prefixes.
           </span>
         )}
         {chips.map((p) => (
@@ -234,6 +235,68 @@ function PrefixListEditor({ value, onChange }) {
         />
         <BtnSecondary onClick={add} data-testid="oif-prefix-add">
           <Plus className="w-4 h-4 mr-1" /> Add prefix
+        </BtnSecondary>
+      </div>
+    </div>
+  );
+}
+
+// Editor for the replacement map (typo→correct). Keys are the wrong prefix,
+// values the corrected prefix — the parser runs this BEFORE the strip list.
+function PrefixReplacementEditor({ value, onChange }) {
+  const [wrong, setWrong] = useState("");
+  const [right, setRight] = useState("");
+  const entries = Object.entries(value || {});
+
+  function add() {
+    const w = wrong.trim(); const r = right.trim();
+    if (!w || !r) return;
+    onChange({ ...(value || {}), [w]: r });
+    setWrong(""); setRight("");
+  }
+  function remove(k) {
+    const next = { ...(value || {}) }; delete next[k]; onChange(next);
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-1.5">
+        {entries.length === 0 && (
+          <span className="text-xs text-neutral-400 italic">
+            None configured. Add typo variants like "FLL" → "FL" so Myntra's doubled-L SKUs normalise correctly.
+          </span>
+        )}
+        {entries.map(([k, v]) => (
+          <span key={k}
+            className="inline-flex items-center gap-1 px-2 py-1 bg-purple-100 text-purple-900 border border-purple-300 rounded text-xs font-mono">
+            {k} <span className="text-purple-500">→</span> {v}
+            <button className="ml-1 hover:text-red-700" onClick={() => remove(k)}>
+              <XIcon className="w-3 h-3" />
+            </button>
+          </span>
+        ))}
+      </div>
+      <div className="flex gap-2 items-end">
+        <input
+          type="text"
+          className="h-9 px-2 rounded-md border border-neutral-300 bg-white text-sm w-32 focus:border-neutral-500 focus:outline-none"
+          placeholder="wrong (FLL)"
+          value={wrong}
+          onChange={(e) => setWrong(e.target.value)}
+          data-testid="oif-replace-wrong"
+        />
+        <span className="text-neutral-400 pb-1">→</span>
+        <input
+          type="text"
+          className="h-9 px-2 rounded-md border border-neutral-300 bg-white text-sm w-32 focus:border-neutral-500 focus:outline-none"
+          placeholder="correct (FL)"
+          value={right}
+          onChange={(e) => setRight(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }}
+          data-testid="oif-replace-right"
+        />
+        <BtnSecondary onClick={add} data-testid="oif-replace-add">
+          <Plus className="w-4 h-4 mr-1" /> Add mapping
         </BtnSecondary>
       </div>
     </div>
@@ -294,6 +357,7 @@ export default function OrderImportFormats() {
       skip_rows_after_header: cfg.skip_rows_after_header ?? 0,
       column_map: cm,
       known_sku_prefixes_to_strip: cfg.known_sku_prefixes_to_strip || [],
+      known_sku_prefix_replacements: cfg.known_sku_prefix_replacements || {},
       is_picklist: !!cfg.is_picklist,
       active: cfg.active !== false,
       notes: cfg.notes || "",
@@ -333,6 +397,7 @@ export default function OrderImportFormats() {
       skip_rows_after_header: Number(form.skip_rows_after_header || 0),
       column_map: cmClean,
       known_sku_prefixes_to_strip: form.known_sku_prefixes_to_strip || [],
+      known_sku_prefix_replacements: form.known_sku_prefix_replacements || {},
       is_picklist: !!form.is_picklist,
       active: !!form.active,
       notes: form.notes || "",
@@ -400,6 +465,7 @@ export default function OrderImportFormats() {
                   <th className="text-left p-3 border-b">Header locator</th>
                   <th className="text-left p-3 border-b">Leaf SKU column</th>
                   <th className="text-left p-3 border-b">Prefix strips</th>
+                  <th className="text-left p-3 border-b">Replacements</th>
                   <th className="text-left p-3 border-b">Type</th>
                   <th className="text-left p-3 border-b">Active</th>
                   <th className="text-right p-3 border-b w-24"></th>
@@ -443,6 +509,19 @@ export default function OrderImportFormats() {
                           {(c.known_sku_prefixes_to_strip || []).map((p) => (
                             <span key={p} className="font-mono text-[10px] bg-amber-100 text-amber-900 px-1.5 py-0.5 rounded border border-amber-300">
                               {p}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </td>
+                    <td className="p-3 text-xs">
+                      {Object.keys(c.known_sku_prefix_replacements || {}).length === 0 ? (
+                        <span className="text-neutral-400">—</span>
+                      ) : (
+                        <div className="flex flex-wrap gap-1">
+                          {Object.entries(c.known_sku_prefix_replacements || {}).map(([k, v]) => (
+                            <span key={k} className="font-mono text-[10px] bg-purple-100 text-purple-900 px-1.5 py-0.5 rounded border border-purple-300">
+                              {k}→{v}
                             </span>
                           ))}
                         </div>
@@ -536,12 +615,25 @@ export default function OrderImportFormats() {
             <Card className="p-4 space-y-2">
               <h4 className="text-xs font-bold uppercase tracking-wider text-neutral-600">Known SKU prefixes to strip</h4>
               <p className="text-[11px] text-neutral-500 leading-snug">
-                Non-numeric prefixes to remove from leaf_sku BEFORE resolve_style() — e.g. Flipkart's
-                "TH" prefix ("THFL_AK_048_BG_37" → "FL_AK_048_BG_37"), or Myntra's doubled "FLL" typo
-                variant ("FLL_AK_005_SL-7" → "FL_AK_005_SL-7"). Added at import time; no code change.
+                Non-numeric prefixes to REMOVE from leaf_sku BEFORE resolve_style() — e.g. Flipkart's
+                "TH" prefix ("THFL_AK_048_BG_37" → "FL_AK_048_BG_37"). Runs AFTER the replacements
+                below. Added at import time; no code change.
               </p>
               <PrefixListEditor value={form.known_sku_prefixes_to_strip}
                 onChange={(v) => setForm({ ...form, known_sku_prefixes_to_strip: v })} />
+            </Card>
+
+            <Card className="p-4 space-y-2">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-neutral-600">
+                SKU prefix replacements <span className="text-purple-700">(typo variants)</span>
+              </h4>
+              <p className="text-[11px] text-neutral-500 leading-snug">
+                Rewrite a leading token — used for TYPO variants of a real SKU token, e.g. Myntra
+                sometimes ships "FLL_..." for our "FL_..." (doubled-L). Runs BEFORE the strip list
+                above. Config-driven so new platform typos onboard without a code deploy.
+              </p>
+              <PrefixReplacementEditor value={form.known_sku_prefix_replacements}
+                onChange={(v) => setForm({ ...form, known_sku_prefix_replacements: v })} />
             </Card>
 
             <div>

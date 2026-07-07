@@ -4426,9 +4426,12 @@ class OrderImportFormatConfigIn(BaseModel):
     column_map: Dict[str, Optional[str]]
     # Non-numeric/non-code prefixes to strip from leaf_sku BEFORE
     # split_leaf_sku()/resolve_style(). Configurable so new platform
-    # prefixes (e.g. "TH" for Flipkart, "FLL" for a Myntra doubled prefix)
-    # can be added without a code deploy.
+    # prefixes (e.g. "TH" for Flipkart) can be added without a code deploy.
     known_sku_prefixes_to_strip: List[str] = Field(default_factory=list)
+    # Typo variants to REPLACE (not strip) — e.g. Myntra sometimes ships
+    # "FLL_..." for "FL_..." (doubled-L). Runs BEFORE strip. Keys are the
+    # wrong token, values the corrected token. Delimiter preserved.
+    known_sku_prefix_replacements: Dict[str, str] = Field(default_factory=dict)
     # True for pure-picklist files that have no order_id at all
     # (e.g. Myntra OP-xxxxx.csv). The importer will derive a
     # picklist_batch_id from the filename in that case.
@@ -4455,6 +4458,7 @@ class OrderImportFormatConfigUpdate(BaseModel):
     skip_rows_after_header: Optional[int] = None
     column_map: Optional[Dict[str, Optional[str]]] = None
     known_sku_prefixes_to_strip: Optional[List[str]] = None
+    known_sku_prefix_replacements: Optional[Dict[str, str]] = None
     is_picklist: Optional[bool] = None
     active: Optional[bool] = None
     notes: Optional[str] = None
@@ -4504,6 +4508,7 @@ DEFAULT_ORDER_IMPORT_CONFIGS = [
             "pincode":          "PIN Code",
         },
         "known_sku_prefixes_to_strip": ["TH"],
+        "known_sku_prefix_replacements": {},
         "is_picklist": False,
         "active": True,
         "notes": "Flipkart order-CSV export. SKU column carries multiple naming variants — split_leaf_sku() + strip_known_prefixes() normalise them. Order Item Id may have a leading apostrophe.",
@@ -4525,16 +4530,25 @@ DEFAULT_ORDER_IMPORT_CONFIGS = [
             "qty":              "quantity",
             "bin_barcode":      "binBarcode",
         },
-        "known_sku_prefixes_to_strip": ["FLL"],   # doubled-FL typo variant seen in fixtures
+        "known_sku_prefixes_to_strip": [],
+        "known_sku_prefix_replacements": {"FLL": "FL"},
         "is_picklist": True,
         "active": True,
-        "notes": "Myntra picklist (OP-xxxxx.csv). No order_id — the filename (minus extension) is stored as picklist_batch_id. sellerSkuCode carries multiple naming variants; strip 'FLL' -> 'FL' before resolving.",
+        "notes": "Myntra picklist (OP-xxxxx.csv). No order_id — the filename (minus extension) is stored as picklist_batch_id. sellerSkuCode carries multiple naming variants; the doubled-L typo 'FLL_...' is REPLACED with 'FL_...' via known_sku_prefix_replacements (config-driven, no code change).",
     },
 ]
 
 
 async def _seed_order_import_configs() -> int:
-    """Idempotently seed order_import_format_configs (Phase G)."""
+    """Idempotently seed order_import_format_configs (Phase G).
+
+    Also performs an in-place UPGRADE on any pre-existing seeded config
+    that pre-dates a schema addition — currently:
+      - adds `known_sku_prefix_replacements` (dict) if missing
+      - migrates any "FLL" that was still living in `known_sku_prefixes_to_strip`
+        (legacy Myntra seed) into `known_sku_prefix_replacements={FLL: FL}`.
+    Non-seeded (user-created) configs are NEVER touched.
+    """
     try:
         await db.order_import_format_configs.create_index(
             "platform", unique=True, name="oifc_platform_unique",
@@ -4545,6 +4559,27 @@ async def _seed_order_import_configs() -> int:
     for cfg in DEFAULT_ORDER_IMPORT_CONFIGS:
         existing = await db.order_import_format_configs.find_one({"platform": cfg["platform"]})
         if existing:
+            # Upgrade path for seeded configs: reconcile with current default
+            # if this row was originally seeded (never touch user-created rows).
+            if existing.get("seeded"):
+                upd: Dict[str, Any] = {}
+                if "known_sku_prefix_replacements" not in existing:
+                    upd["known_sku_prefix_replacements"] = cfg.get("known_sku_prefix_replacements") or {}
+                # Legacy Myntra: FLL was mis-classified as a strip prefix; move it.
+                strip_list = list(existing.get("known_sku_prefixes_to_strip") or [])
+                if cfg["platform"] == "myntra" and "FLL" in strip_list:
+                    strip_list = [p for p in strip_list if p != "FLL"]
+                    upd["known_sku_prefixes_to_strip"] = strip_list
+                    reps = dict(existing.get("known_sku_prefix_replacements") or {})
+                    reps.setdefault("FLL", "FL")
+                    upd["known_sku_prefix_replacements"] = reps
+                    upd["notes"] = cfg.get("notes") or existing.get("notes")
+                if upd:
+                    upd["updated_at"] = now_iso()
+                    await db.order_import_format_configs.update_one(
+                        {"platform": cfg["platform"]}, {"$set": upd}
+                    )
+                    log.info(f"Order import registry: upgraded seeded config for {cfg['platform']}: {list(upd.keys())}")
             continue
         doc = dict(cfg)
         doc["created_at"] = now_iso()
@@ -4633,6 +4668,39 @@ def strip_known_prefixes(sku: str, prefixes: List[str]) -> Tuple[str, Optional[s
             if rest and rest[0] in "_-":
                 rest = rest[1:]
             return rest, pfx
+    return s, None
+
+
+def apply_prefix_replacements(sku: str, replacements: Dict[str, str]) -> Tuple[str, Optional[str]]:
+    """Rewrite the FIRST matching *token-boundary* prefix.
+
+    Unlike strip_known_prefixes() which removes a leading prefix (plus a
+    following delimiter), this REPLACES a leading token — used for
+    "typo variants" of a legitimate SKU token (e.g. Myntra's doubled
+    "FLL" for the real "FL"). The delimiter is preserved.
+
+    Example:
+        apply_prefix_replacements("FLL_AK_005_SL-7", {"FLL": "FL"})
+        → ("FL_AK_005_SL-7", "FLL")
+
+    Config-driven so new platform typo variants can be onboarded
+    without touching code.
+    """
+    s = (sku or "").strip()
+    if not s or not replacements:
+        return s, None
+    # Longest key first so "FLLL" would win over "FLL" if both existed.
+    for wrong in sorted(replacements.keys(), key=len, reverse=True):
+        if not wrong:
+            continue
+        right = str(replacements.get(wrong) or "")
+        if s.startswith(wrong):
+            rest = s[len(wrong):]
+            # Only treat this as a token-boundary hit if followed by delimiter
+            # or end-of-string — avoids clobbering "FLL" that's actually part
+            # of a longer legit token like "FLLAT".
+            if not rest or rest[0] in "_-":
+                return right + rest, wrong
     return s, None
 
 
@@ -4792,6 +4860,7 @@ async def _parse_and_resolve_order_row(
     resolve the leaf_sku through sku_map / styles.code."""
     column_map: Dict[str, Optional[str]] = cfg.get("column_map") or {}
     prefixes  = cfg.get("known_sku_prefixes_to_strip") or []
+    replacements = cfg.get("known_sku_prefix_replacements") or {}
 
     def _pick(canonical: str) -> str:
         col = column_map.get(canonical)
@@ -4825,9 +4894,13 @@ async def _parse_and_resolve_order_row(
     leaf_raw = canon.get("leaf_sku") or ""
     canon["leaf_sku_raw"] = leaf_raw
 
-    # Normalise sku: strip apostrophe + known prefixes
+    # Normalise sku: strip apostrophe, apply typo-replacements, then strip prefixes.
+    # Order matters: FLL→FL replacement runs BEFORE strip so that a config
+    # combining both (rare but possible) still normalises consistently.
     leaf = strip_excel_apostrophe(leaf_raw)
-    leaf_stripped, matched_prefix = strip_known_prefixes(leaf, prefixes)
+    leaf_after_replace, replaced_from = apply_prefix_replacements(leaf, replacements)
+    leaf_stripped, matched_prefix = strip_known_prefixes(leaf_after_replace, prefixes)
+    canon["leaf_sku_replaced_prefix"] = replaced_from
     canon["leaf_sku_stripped_prefix"] = matched_prefix
     canon["leaf_sku"] = leaf_stripped
 
@@ -5005,6 +5078,7 @@ async def import_online_orders_configured(
                 "leaf_sku_raw":      canon.get("leaf_sku_raw"),
                 "leaf_sku":          canon.get("leaf_sku"),
                 "leaf_sku_stripped_prefix": canon.get("leaf_sku_stripped_prefix"),
+                "leaf_sku_replaced_prefix": canon.get("leaf_sku_replaced_prefix"),
                 "group_id":          canon.get("group_id"),
                 "myntra_sku_code":   canon.get("myntra_sku_code"),
                 "product_title":     canon.get("product_title"),
